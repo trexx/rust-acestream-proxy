@@ -129,11 +129,11 @@ Throughput is not the constraint the copy-first design was built to avoid. Servi
 
 Run it in the same cluster as the engine — it pulls the full muxed stream per content id. Set `ENGINE_HOST` to the engine's in-cluster address.
 
-## Casting to Chromecast Audio
+## Casting to a Chromecast
 
-Audio-only cast targets can't decode the muxed TS — hand them this service's stream instead. Chromecast Audio plays AAC, so the default (ADTS) output works and keeps the stream-copy path: the device receives the original audio untouched. The webplayer expects this service path-routed at `/audio` on the engine host, so the Home Assistant automation should call `media_player.play_media` with `http://<host from the cast payload>/audio?id=<id>` and `media_content_type: "music"` for audio devices. If a device won't play ADTS, append `&fmt=mp3` as a fallback.
+A video Chromecast is sent `/video` and plays it directly; that has been verified on a real device. Audio-only cast targets can't decode the muxed TS — hand them this service's stream instead. Chromecast Audio plays AAC, so the default (ADTS) output works and keeps the stream-copy path: the device receives the original audio untouched. The webplayer expects this service path-routed at `/audio` on the engine host, so the Home Assistant automation should call `media_player.play_media` with `http://<host from the cast payload>/audio?id=<id>` and `media_content_type: "music"` for audio devices. If a device won't play ADTS, append `&fmt=mp3` as a fallback.
 
-This guidance covers `/audio`. The webplayer's Cast sends `/video` to video Chromecasts over the same path, but playback of `/video` on a Chromecast has not been verified from this side.
+The webplayer's Cast picks the endpoint per device: entries marked audio-only are sent `/audio`, the rest `/video`.
 
 ## Local development
 
