@@ -56,6 +56,12 @@ impl OutputFormat {
         matches!(self, OutputFormat::Fmp4)
     }
 
+    /// Whether the output carries the video track. Decides how a new encoder
+    /// is primed: video wants to start on a keyframe, audio does not care.
+    pub fn has_video(self) -> bool {
+        matches!(self, OutputFormat::Fmp4)
+    }
+
     /// The `fmt=` values accepted on /audio.
     pub fn parse_audio(s: &str) -> Option<Self> {
         match s {
@@ -80,13 +86,15 @@ pub struct Plan {
     pub audio: TrackMode,
 }
 
-/// Fragment duration override for fMP4, in milliseconds.
+/// Fragment duration for fMP4, in milliseconds. `None` fragments on keyframes
+/// only.
 ///
-/// Unset means keyframe-only fragmentation: a `moof` cannot be written until
-/// its fragment is complete, so fragment duration is a hard latency floor equal
-/// to the source GOP. Setting this cuts fragments mid-GOP, which lowers latency
-/// but lands late joiners on a non-keyframe boundary (artifacts until the next
-/// IDR).
+/// A `moof` cannot be written until its fragment is complete, so the fragment
+/// duration is a hard latency floor. Keyframe-only fragments make that floor
+/// the source GOP: each fragment is emitted when the *next* keyframe arrives,
+/// so its content is already one GOP old. A timed cut keeps fragments short;
+/// `frag_keyframe` stays on as well, so every keyframe still opens a fragment
+/// and late joiners can be aligned to one (see `mp4::Piece::keyframe`).
 pub type FragDurationMs = Option<u32>;
 
 fn s(v: &str) -> String {
@@ -96,75 +104,63 @@ fn s(v: &str) -> String {
 /// How much input ffmpeg may examine before it must have identified the
 /// streams, as `(analyzeduration_us, probesize_bytes)`.
 ///
-/// These are *not* free caps that `find_stream_info` exits early from — startup
-/// tracks them almost one-for-one, so the value is a direct latency cost.
+/// This is not a free cap that `find_stream_info` exits early from: MPEG-TS
+/// has no header, so ffmpeg reads the whole window regardless — instantly when
+/// the replay window supplies it, at stream rate otherwise.
 ///
-/// Video needs more than audio. Copying H.264 into MP4 requires SPS/PPS
-/// extradata to build the `avcC` box; too small a window gives "non-existing
-/// PPS 0 referenced" then "dimensions not set", and the muxer refuses to write
-/// a header at all. Audio parameters come from any frame header.
+/// Copying H.264 into MP4 requires SPS/PPS extradata to build the `avcC` box,
+/// which arrive only with a keyframe. The window must therefore reach from
+/// wherever ffmpeg starts reading to the first keyframe, or the muxer refuses
+/// to write a header at all ("non-existing PPS 0 referenced", then "dimensions
+/// not set"). Measured on a 3s-GOP stream: from a keyframe-aligned start every
+/// window from 0.5s up succeeds; from a mid-GOP start 1s fails outright.
 ///
-/// Measured against 23MB of real 720p broadcast TS (1.92s GOP), attaching at 12
-/// different offsets, with and without the [`REPLAY_BYTES`] window in front:
+/// So a video encoder primed from a keyframe (the normal case, see
+/// `replay::Policy::FromKeyframe`) gets 2s — comfortably over what it needs,
+/// cheap because the replay window satisfies it at pipe speed — and one that
+/// could not be gets 3s, the previous fixed value, which covers a mid-GOP
+/// start on a GOP of up to 3s. Audio parameters come from any frame header, so
+/// 1s is plenty there.
 ///
-/// ```text
-///   analyzeduration    cold      with replay
-///   0.5s               0/5       0/5
-///   1s                 1/5       0/5
-///   2s                 5/5       5/5      <- floor, and 12/12 on a wider sweep
-///   3s                 12/12     12/12
-/// ```
-///
-/// The floor is ~2s of *content* regardless of where the encoder attaches, so
-/// replay does not move it — its job is removing the intermittent total
-/// failures, not shrinking this window. `probesize` was not the binding
-/// constraint at any value from 1MB up.
-///
-/// This window does **not** need to exceed the source GOP, which is the obvious
-/// but wrong intuition: a 1080p stream with a 4.0s GOP starts reliably on this
-/// 3s window (6/6 cold starts against a real engine). [`REPLAY_BYTES`] is why —
-/// ffmpeg is handed a keyframe in its opening bytes, so it never has to wait
-/// one out. Shrinking the replay window would put that back in play.
-///
-/// 3s is therefore the ~2s content floor plus margin, not a GOP multiple.
-/// Silently failing to start is far worse than a second of one-off latency, and
-/// fan-out means only the *first* listener of a content id pays it at all.
-fn probe_window(fmt: OutputFormat) -> (&'static str, &'static str) {
+/// probesize was never the binding constraint; it also sizes the buffer the
+/// demuxer keeps for seeking back after its header scan, so it is kept modest.
+fn probe_window(fmt: OutputFormat, keyframe_start: bool) -> (&'static str, &'static str) {
     match fmt {
-        OutputFormat::Fmp4 => ("3000000", "10000000"),
+        OutputFormat::Fmp4 if keyframe_start => ("2000000", "5000000"),
+        OutputFormat::Fmp4 => ("3000000", "5000000"),
         _ => ("1000000", "500000"),
     }
 }
 
-/// Input-side options. These must precede `-i`: `-fflags` and `-flags` are
-/// demuxer/decoder options and are silently inert if placed after it.
-fn input_args(fmt: OutputFormat) -> Vec<String> {
-    let (analyzeduration, probesize) = probe_window(fmt);
+/// Input-side options. These must precede `-i`: `-fflags` is a demuxer option
+/// and is silently inert if placed after it.
+///
+/// Deliberately *without* `-avioflags direct` here, although it is set on the
+/// output. The mpegts demuxer scans the start of the input for its tables and
+/// then seeks back through the AVIO buffer to re-read it; with direct I/O
+/// there is no buffer, the seek fails ("Unable to seek back to the start",
+/// logged only at info level) and everything the scan consumed is lost.
+/// Measured at 1.5–2.6MB per encoder start, which is most of the replay window
+/// and several seconds of a live stream, and it varied from run to run. The
+/// buffer costs no latency: a pipe read returns whatever is there.
+///
+/// Also without `-fflags nobuffer`, despite its billing as a low-latency flag:
+/// it slows stream analysis and so delays first output. Output-side latency is
+/// handled by -flush_packets and -avioflags direct, which cost nothing.
+fn input_args(fmt: OutputFormat, keyframe_start: bool) -> Vec<String> {
+    let (analyzeduration, probesize) = probe_window(fmt, keyframe_start);
     [
         "-hide_banner",
         "-loglevel",
         "error",
-        // Position-sensitive: also set on the output side below.
-        "-avioflags",
-        "direct",
         // discardcorrupt matters for a P2P source, where corrupt and partial
         // frames are routine rather than exceptional.
-        //
-        // Deliberately *without* `nobuffer`, despite its billing as a
-        // low-latency flag. Measured, it slows stream analysis and so delays
-        // first output: ~2s worse on video at a 2s window, ~4s at 5s, ~0.6s on
-        // audio. Output-side latency is handled by -flush_packets and
-        // -avioflags direct, which cost nothing.
         "-fflags",
         "discardcorrupt",
-        "-flags",
-        "low_delay",
         "-analyzeduration",
         analyzeduration,
         "-probesize",
         probesize,
-        "-max_delay",
-        "0",
         // The input is always raw TS from the engine puller; naming the demuxer
         // skips format detection entirely.
         "-f",
@@ -194,35 +190,66 @@ fn aac_encode() -> Vec<String> {
         .collect()
 }
 
-/// Build the full ffmpeg argv for one stream.
+/// The copy-first decision for one (format, source audio codec) pair.
 ///
 /// `audio_codec` is the source's first audio stream codec name as reported by
 /// ffprobe (e.g. "aac", "ac3"); `None` means no audio stream was found.
-pub fn plan(fmt: OutputFormat, audio_codec: Option<&str>, frag_ms: FragDurationMs) -> Plan {
-    let mut args = input_args(fmt);
-    let video;
-    let audio;
+pub fn modes(fmt: OutputFormat, audio_codec: Option<&str>) -> (TrackMode, TrackMode) {
+    match fmt {
+        OutputFormat::Adts | OutputFormat::Mp3 => {
+            let want = if fmt == OutputFormat::Adts {
+                "aac"
+            } else {
+                "mp3"
+            };
+            let audio = if audio_codec == Some(want) {
+                TrackMode::Copy
+            } else {
+                TrackMode::Transcode
+            };
+            (TrackMode::Dropped, audio)
+        }
+        OutputFormat::Fmp4 => {
+            // AC-3, E-AC-3 and MP2 are legal in MP4 but browsers will not decode
+            // them, so a blanket `-c copy` yields video with silence. Only AAC
+            // survives the copy path.
+            let audio = match audio_codec {
+                Some("aac") => TrackMode::Copy,
+                Some(_) => TrackMode::Transcode,
+                None => TrackMode::Dropped,
+            };
+            (TrackMode::Copy, audio)
+        }
+    }
+}
+
+/// Build the full ffmpeg argv for one stream.
+///
+/// `keyframe_start` says the encoder will be primed from a video keyframe, so
+/// stream analysis can be short; see [`probe_window`].
+pub fn plan(
+    fmt: OutputFormat,
+    audio_codec: Option<&str>,
+    frag_ms: FragDurationMs,
+    keyframe_start: bool,
+) -> Plan {
+    let mut args = input_args(fmt, keyframe_start);
+    let (video, audio) = modes(fmt, audio_codec);
 
     match fmt {
         OutputFormat::Adts | OutputFormat::Mp3 => {
-            video = TrackMode::Dropped;
             args.extend(["-vn", "-sn", "-dn"].iter().map(|v| s(v)));
 
-            let want = if fmt == OutputFormat::Adts { "aac" } else { "mp3" };
-            if audio_codec == Some(want) {
-                audio = TrackMode::Copy;
+            if audio == TrackMode::Copy {
                 args.extend(["-c:a", "copy"].iter().map(|v| s(v)));
+            } else if fmt == OutputFormat::Adts {
+                args.extend(aac_encode());
             } else {
-                audio = TrackMode::Transcode;
-                if fmt == OutputFormat::Adts {
-                    args.extend(aac_encode());
-                } else {
-                    args.extend(
-                        ["-c:a", "libmp3lame", "-b:a", "128k", "-ac", "2"]
-                            .iter()
-                            .map(|v| s(v)),
-                    );
-                }
+                args.extend(
+                    ["-c:a", "libmp3lame", "-b:a", "128k", "-ac", "2"]
+                        .iter()
+                        .map(|v| s(v)),
+                );
             }
 
             args.extend(flush_args());
@@ -232,43 +259,47 @@ pub fn plan(fmt: OutputFormat, audio_codec: Option<&str>, frag_ms: FragDurationM
         OutputFormat::Fmp4 => {
             // Video is always copied: that is where the CPU win is, and it is
             // what "zero copy" means here (no re-encode, not untouched bytes).
-            video = TrackMode::Copy;
             args.extend(["-c:v", "copy"].iter().map(|v| s(v)));
 
-            // AC-3, E-AC-3 and MP2 are legal in MP4 but browsers will not decode
-            // them, so a blanket `-c copy` yields video with silence. Only AAC
-            // survives the copy path.
-            if audio_codec == Some("aac") {
-                audio = TrackMode::Copy;
-                args.extend(["-c:a", "copy"].iter().map(|v| s(v)));
-                // MPEG-TS carries AAC in ADTS framing; MP4 wants raw AAC with
-                // an AudioSpecificConfig in the sample entry. The muxer does
-                // not convert on copy — without this it aborts the stream with
-                // "Malformed AAC bitstream detected". Not needed on the /audio
-                // routes, where ADTS is the native output framing, nor when
-                // transcoding, since the encoder emits raw AAC.
-                args.extend(["-bsf:a", "aac_adtstoasc"].iter().map(|v| s(v)));
-            } else if audio_codec.is_some() {
-                audio = TrackMode::Transcode;
-                args.extend(aac_encode());
-            } else {
-                audio = TrackMode::Dropped;
-                args.push(s("-an"));
+            match audio {
+                TrackMode::Copy => {
+                    args.extend(["-c:a", "copy"].iter().map(|v| s(v)));
+                    // MPEG-TS carries AAC in ADTS framing; MP4 wants raw AAC with
+                    // an AudioSpecificConfig in the sample entry. The muxer does
+                    // not convert on copy — without this it aborts the stream with
+                    // "Malformed AAC bitstream detected". Not needed on the /audio
+                    // routes, where ADTS is the native output framing, nor when
+                    // transcoding, since the encoder emits raw AAC.
+                    args.extend(["-bsf:a", "aac_adtstoasc"].iter().map(|v| s(v)));
+                }
+                TrackMode::Transcode => args.extend(aac_encode()),
+                TrackMode::Dropped => args.push(s("-an")),
             }
 
             // Broadcast TS carries timestamp discontinuities that MP4 rejects.
             args.extend(["-avoid_negative_ts", "make_zero"].iter().map(|v| s(v)));
             args.extend(flush_args());
 
-            let mut movflags =
-                s("+frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset");
             if let Some(ms) = frag_ms {
-                // frag_duration is in microseconds.
-                args.extend(["-frag_duration", &(ms as u64 * 1000).to_string()].iter().map(|v| s(v)));
-                movflags = s("+empty_moov+default_base_moof+omit_tfhd_offset");
+                // frag_duration is in microseconds. The muxer ORs it with
+                // frag_keyframe below, so a keyframe still always opens a fragment.
+                args.extend(
+                    ["-frag_duration", &(u64::from(ms) * 1000).to_string()]
+                        .iter()
+                        .map(|v| s(v)),
+                );
             }
-            args.extend(["-movflags", &movflags].iter().map(|v| s(v)));
-            args.extend(["-f", "mp4", "pipe:1"].iter().map(|v| s(v)));
+            args.extend(
+                [
+                    "-movflags",
+                    "+frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
+                    "-f",
+                    "mp4",
+                    "pipe:1",
+                ]
+                .iter()
+                .map(|v| s(v)),
+            );
         }
     }
 
@@ -279,8 +310,10 @@ pub fn plan(fmt: OutputFormat, audio_codec: Option<&str>, frag_ms: FragDurationM
 mod tests {
     use super::*;
 
+    const ALL: [OutputFormat; 3] = [OutputFormat::Adts, OutputFormat::Mp3, OutputFormat::Fmp4];
+
     fn args_of(fmt: OutputFormat, codec: Option<&str>) -> Vec<String> {
-        plan(fmt, codec, None).args
+        plan(fmt, codec, None, false).args
     }
 
     /// Assert `needle` appears as a consecutive run in `hay`.
@@ -288,9 +321,17 @@ mod tests {
         hay.windows(needle.len()).any(|w| w == needle)
     }
 
+    fn value_after(args: &[String], flag: &str) -> String {
+        let i = args
+            .iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("no {flag}"));
+        args[i + 1].clone()
+    }
+
     #[test]
     fn adts_copies_aac() {
-        let p = plan(OutputFormat::Adts, Some("aac"), None);
+        let p = plan(OutputFormat::Adts, Some("aac"), None, false);
         assert_eq!(p.audio, TrackMode::Copy);
         assert_eq!(p.video, TrackMode::Dropped);
         assert!(contains_seq(&p.args, &["-c:a", "copy"]));
@@ -300,7 +341,7 @@ mod tests {
     #[test]
     fn adts_transcodes_everything_else() {
         for codec in ["ac3", "eac3", "mp2", "dts", "mp3"] {
-            let p = plan(OutputFormat::Adts, Some(codec), None);
+            let p = plan(OutputFormat::Adts, Some(codec), None, false);
             assert_eq!(p.audio, TrackMode::Transcode, "codec {codec}");
             assert!(contains_seq(&p.args, &["-c:a", "aac"]), "codec {codec}");
         }
@@ -308,11 +349,11 @@ mod tests {
 
     #[test]
     fn mp3_copies_mp3_only() {
-        let p = plan(OutputFormat::Mp3, Some("mp3"), None);
+        let p = plan(OutputFormat::Mp3, Some("mp3"), None, false);
         assert_eq!(p.audio, TrackMode::Copy);
         assert!(contains_seq(&p.args, &["-c:a", "copy"]));
 
-        let p = plan(OutputFormat::Mp3, Some("aac"), None);
+        let p = plan(OutputFormat::Mp3, Some("aac"), None, false);
         assert_eq!(p.audio, TrackMode::Transcode);
         assert!(contains_seq(&p.args, &["-c:a", "libmp3lame"]));
     }
@@ -320,7 +361,7 @@ mod tests {
     #[test]
     fn fmp4_always_copies_video() {
         for codec in [Some("aac"), Some("ac3"), Some("mp2"), None] {
-            let p = plan(OutputFormat::Fmp4, codec, None);
+            let p = plan(OutputFormat::Fmp4, codec, None, false);
             assert_eq!(p.video, TrackMode::Copy, "codec {codec:?}");
             assert!(contains_seq(&p.args, &["-c:v", "copy"]), "codec {codec:?}");
         }
@@ -330,41 +371,50 @@ mod tests {
     fn fmp4_transcodes_browser_hostile_audio() {
         // AC-3/E-AC-3/MP2 are legal in MP4 but browsers play them as silence.
         for codec in ["ac3", "eac3", "mp2"] {
-            let p = plan(OutputFormat::Fmp4, Some(codec), None);
+            let p = plan(OutputFormat::Fmp4, Some(codec), None, false);
             assert_eq!(p.audio, TrackMode::Transcode, "codec {codec}");
             assert!(contains_seq(&p.args, &["-c:a", "aac"]), "codec {codec}");
         }
-        let p = plan(OutputFormat::Fmp4, Some("aac"), None);
+        let p = plan(OutputFormat::Fmp4, Some("aac"), None, false);
         assert_eq!(p.audio, TrackMode::Copy);
+    }
+
+    #[test]
+    fn modes_match_the_plan() {
+        for fmt in ALL {
+            for codec in [Some("aac"), Some("ac3"), Some("mp3"), None] {
+                let p = plan(fmt, codec, None, false);
+                assert_eq!(modes(fmt, codec), (p.video, p.audio), "{fmt} {codec:?}");
+            }
+        }
     }
 
     #[test]
     fn fmp4_converts_adts_framing_when_copying_aac() {
         // Only on the copy path into MP4: the encoder already emits raw AAC,
         // and ADTS output wants ADTS framing.
-        let p = plan(OutputFormat::Fmp4, Some("aac"), None);
+        let p = plan(OutputFormat::Fmp4, Some("aac"), None, false);
         assert!(contains_seq(&p.args, &["-bsf:a", "aac_adtstoasc"]));
 
-        let p = plan(OutputFormat::Fmp4, Some("ac3"), None);
+        let p = plan(OutputFormat::Fmp4, Some("ac3"), None, false);
         assert!(!p.args.iter().any(|a| a == "-bsf:a"));
         for fmt in [OutputFormat::Adts, OutputFormat::Mp3] {
-            let p = plan(fmt, Some("aac"), None);
+            let p = plan(fmt, Some("aac"), None, false);
             assert!(!p.args.iter().any(|a| a == "-bsf:a"), "{fmt}");
         }
     }
 
     #[test]
     fn fmp4_without_audio_drops_the_track() {
-        let p = plan(OutputFormat::Fmp4, None, None);
+        let p = plan(OutputFormat::Fmp4, None, None, false);
         assert_eq!(p.audio, TrackMode::Dropped);
         assert!(p.args.iter().any(|a| a == "-an"));
     }
 
     #[test]
     fn fmp4_movflags_are_mse_compatible() {
-        let p = plan(OutputFormat::Fmp4, Some("aac"), None);
-        let i = p.args.iter().position(|a| a == "-movflags").unwrap();
-        let flags = &p.args[i + 1];
+        let p = plan(OutputFormat::Fmp4, Some("aac"), None, false);
+        let flags = value_after(&p.args, "-movflags");
         for want in [
             "frag_keyframe",
             "empty_moov",
@@ -396,9 +446,9 @@ mod tests {
             .collect();
 
         for frag in [None, Some(200)] {
-            let p = plan(OutputFormat::Fmp4, Some("aac"), frag);
-            let i = p.args.iter().position(|a| a == "-movflags").unwrap();
-            for flag in p.args[i + 1].split('+').filter(|f| !f.is_empty()) {
+            let p = plan(OutputFormat::Fmp4, Some("aac"), frag, false);
+            let flags = value_after(&p.args, "-movflags");
+            for flag in flags.split('+').filter(|f| !f.is_empty()) {
                 assert!(
                     accepted.contains(&flag),
                     "ffmpeg does not accept movflag {flag:?}"
@@ -408,42 +458,69 @@ mod tests {
     }
 
     #[test]
-    fn frag_duration_replaces_keyframe_fragmentation() {
-        let p = plan(OutputFormat::Fmp4, Some("aac"), Some(200));
+    fn frag_duration_adds_to_keyframe_fragmentation() {
+        let p = plan(OutputFormat::Fmp4, Some("aac"), Some(200), false);
         assert!(contains_seq(&p.args, &["-frag_duration", "200000"]));
-        let i = p.args.iter().position(|a| a == "-movflags").unwrap();
-        // frag_keyframe would pin fragments back to the GOP and defeat the knob.
-        assert!(!p.args[i + 1].contains("frag_keyframe"));
+        // Without frag_keyframe a timed cut lands late joiners mid-GOP; the two
+        // combine, so every keyframe still opens a fragment.
+        assert!(value_after(&p.args, "-movflags").contains("frag_keyframe"));
+
+        let p = plan(OutputFormat::Fmp4, Some("aac"), None, false);
+        assert!(!p.args.iter().any(|a| a == "-frag_duration"));
     }
 
     #[test]
     fn demuxer_options_precede_the_input() {
-        // -fflags/-flags after -i are silently inert; guard against a reorder.
-        for fmt in [OutputFormat::Adts, OutputFormat::Mp3, OutputFormat::Fmp4] {
+        // -fflags after -i is silently inert; guard against a reorder.
+        for fmt in ALL {
             let args = args_of(fmt, Some("ac3"));
             let i = args.iter().position(|a| a == "-i").unwrap();
-            let fflags = args.iter().position(|a| a == "-fflags").unwrap();
-            let flags = args.iter().position(|a| a == "-flags").unwrap();
-            assert!(fflags < i, "{fmt}");
-            assert!(flags < i, "{fmt}");
+            for flag in ["-fflags", "-analyzeduration", "-probesize", "-f"] {
+                let at = args.iter().position(|a| a == flag).unwrap();
+                assert!(at < i, "{fmt}: {flag} must precede -i");
+            }
         }
     }
 
     #[test]
-    fn output_is_flushed_per_packet() {
-        for fmt in [OutputFormat::Adts, OutputFormat::Mp3, OutputFormat::Fmp4] {
+    fn output_is_flushed_per_packet_but_input_is_buffered() {
+        for fmt in ALL {
             let args = args_of(fmt, Some("aac"));
             assert!(contains_seq(&args, &["-flush_packets", "1"]), "{fmt}");
-            // -avioflags direct is meaningful on both sides of -i.
-            assert_eq!(args.iter().filter(|a| *a == "-avioflags").count(), 2, "{fmt}");
+            // Direct I/O on the input side makes the mpegts demuxer lose its
+            // table scan (see `input_args`); it belongs on the output only.
+            let i = args.iter().position(|a| a == "-i").unwrap();
+            let direct: Vec<usize> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "-avioflags")
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(direct.len(), 1, "{fmt}");
+            assert!(direct[0] > i, "{fmt}: -avioflags must follow -i");
+        }
+    }
+
+    #[test]
+    fn video_analysis_is_shorter_from_a_keyframe() {
+        let cold = plan(OutputFormat::Fmp4, Some("aac"), None, false);
+        let warm = plan(OutputFormat::Fmp4, Some("aac"), None, true);
+        assert_eq!(value_after(&cold.args, "-analyzeduration"), "3000000");
+        assert_eq!(value_after(&warm.args, "-analyzeduration"), "2000000");
+        for fmt in [OutputFormat::Adts, OutputFormat::Mp3] {
+            let p = plan(fmt, Some("aac"), None, true);
+            assert_eq!(value_after(&p.args, "-analyzeduration"), "1000000", "{fmt}");
         }
     }
 
     #[test]
     fn input_is_always_the_shared_ts_pipe() {
-        for fmt in [OutputFormat::Adts, OutputFormat::Mp3, OutputFormat::Fmp4] {
+        for fmt in ALL {
             let args = args_of(fmt, Some("aac"));
-            assert!(contains_seq(&args, &["-f", "mpegts", "-i", "pipe:0"]), "{fmt}");
+            assert!(
+                contains_seq(&args, &["-f", "mpegts", "-i", "pipe:0"]),
+                "{fmt}"
+            );
         }
     }
 

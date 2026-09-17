@@ -47,6 +47,15 @@ const MAX_HEADER_LINES: usize = 64;
 /// tiny_http does today.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long one write to a client may block. A phone that drops off the
+/// network without closing leaves the socket's send buffer full and a blocking
+/// write stuck until the kernel gives up on retransmission — a quarter of an
+/// hour by default. Until then the request thread, its `Subscription`, and so
+/// the encoder and engine pull behind it, all stay alive for nobody. Long
+/// enough that a healthy client on a bad link is never cut off by this alone:
+/// the fan-out evicts it on lag first.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -279,6 +288,9 @@ impl Request {
         if let Err(e) = stream.set_read_timeout(Some(HEAD_TIMEOUT)) {
             log::warn(&format!("could not set a read timeout: {e}"));
         }
+        if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
+            log::warn(&format!("could not set a write timeout: {e}"));
+        }
         let peer = stream
             .peer_addr()
             .map(|a| a.to_string())
@@ -323,8 +335,17 @@ impl Request {
         &self.peer
     }
 
+    /// Answer with a framed response. A HEAD request gets the head alone,
+    /// with the Content-Length the GET would have carried.
     pub fn respond(mut self, response: Response) {
-        let _ = response.write_to(&mut self.stream);
+        let head_only = self.method == "HEAD";
+        let _ = response.write_to(&mut self.stream, head_only);
+    }
+
+    /// A second handle on the socket, for whoever needs to shut it down from
+    /// another thread while a body is streaming.
+    pub fn socket_handle(&self) -> Option<TcpStream> {
+        self.stream.try_clone().ok()
     }
 
     /// Hand over the socket so the caller can write the head and stream a body
@@ -337,7 +358,7 @@ impl Request {
 fn respond_error(stream: &mut TcpStream, e: &Error) -> std::io::Result<()> {
     Response::from_string(format!("{e}\n"))
         .with_status_code(e.status())
-        .write_to(stream)
+        .write_to(stream, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -397,7 +418,7 @@ impl Response {
         self
     }
 
-    fn write_to(&self, w: &mut impl Write) -> std::io::Result<()> {
+    fn write_to(&self, w: &mut impl Write, head_only: bool) -> std::io::Result<()> {
         let mut head = format!("HTTP/1.1 {} {}\r\n", self.status, reason(self.status));
         for (name, value) in &self.headers {
             head.push_str(name);
@@ -416,7 +437,7 @@ impl Response {
         head.push_str("Connection: close\r\n\r\n");
 
         w.write_all(head.as_bytes())?;
-        if !self.body.is_empty() {
+        if !self.body.is_empty() && !head_only {
             w.write_all(&self.body)?;
         }
         w.flush()
@@ -622,7 +643,7 @@ mod tests {
         let mut out = Vec::new();
         Response::from_string("ok")
             .with_header("Content-Type", "text/plain")
-            .write_to(&mut out)
+            .write_to(&mut out, false)
             .unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -632,9 +653,18 @@ mod tests {
     }
 
     #[test]
+    fn head_gets_the_framing_but_not_the_body() {
+        let mut out = Vec::new();
+        Response::from_string("ok").write_to(&mut out, true).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Content-Length: 2\r\n"));
+        assert!(text.ends_with("\r\n\r\n"), "no body after the head: {text:?}");
+    }
+
+    #[test]
     fn omits_content_length_on_204() {
         let mut out = Vec::new();
-        Response::empty(204).write_to(&mut out).unwrap();
+        Response::empty(204).write_to(&mut out, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert!(!text.contains("Content-Length"));

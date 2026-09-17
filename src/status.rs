@@ -31,6 +31,8 @@ pub fn snapshot(reg: &Registry, started: Instant) -> Value {
                         "audio": e.audio.to_string(),
                         "uptime_s": e.started.elapsed().as_secs(),
                         "bytes_out": e.bytes_out.load(Ordering::Relaxed),
+                        // No listener; ffmpeg is being kept for a reconnect.
+                        "lingering": e.lingering(),
                         "listeners": listeners
                             .iter()
                             .map(|(peer, uptime_s, bytes)| json!({
@@ -48,6 +50,8 @@ pub fn snapshot(reg: &Registry, started: Instant) -> Value {
                 "content_id": s.content_id,
                 "uptime_s": s.started.elapsed().as_secs(),
                 "bytes_from_engine": s.bytes_in.load(Ordering::Relaxed),
+                // No encoder; the pull is being kept for a reconnect.
+                "lingering": s.lingering(),
                 "source": {
                     "video": probe.and_then(|p| p.video.clone()),
                     "audio": probe.and_then(|p| p.audio.clone()),

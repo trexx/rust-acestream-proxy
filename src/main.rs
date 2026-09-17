@@ -16,14 +16,16 @@ mod http;
 mod mp4;
 mod probe;
 mod registry;
+mod replay;
 mod status;
+mod ts;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engine::log;
 use format::OutputFormat;
@@ -39,18 +41,21 @@ fn main() {
         }
     };
     let addr = normalise_addr(&env_or("LISTEN_ADDR", ":8080"));
-    let frag_duration_ms = match std::env::var("FRAG_DURATION_MS") {
-        Ok(v) if !v.is_empty() => match v.parse::<u32>() {
-            Ok(ms) if ms > 0 => Some(ms),
-            _ => {
-                log::error(&format!(
-                    "FRAG_DURATION_MS must be a positive integer, got {v:?}"
-                ));
-                std::process::exit(1);
-            }
-        },
-        _ => None,
+    // Fragments are cut on a timer as well as on keyframes: the moof cannot
+    // be written until its fragment is complete, so with keyframe-only
+    // fragmentation a viewer sits a whole GOP behind. Late joiners are still
+    // aligned to a keyframe fragment (see mp4::Piece::keyframe), so the timed
+    // cut costs no artifacts. 0 restores keyframe-only fragmentation.
+    let frag_duration_ms = match env_or("FRAG_DURATION_MS", "1000").parse::<u32>() {
+        Ok(0) => None,
+        Ok(ms) => Some(ms),
+        Err(_) => {
+            log::error("FRAG_DURATION_MS must be a non-negative integer");
+            std::process::exit(1);
+        }
     };
+    let encoder_linger = env_seconds("ENCODER_LINGER_S", 15);
+    let engine_linger = env_seconds("ENGINE_LINGER_S", 60);
 
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
@@ -63,14 +68,18 @@ fn main() {
     let registry = Registry::new(Config {
         engine_host: engine_host.clone(),
         frag_duration_ms,
+        encoder_linger,
+        engine_linger,
     });
     let started = Instant::now();
 
     log::info(&format!(
-        "listening on {addr} (engine host: {engine_host}, fragments: {})",
+        "listening on {addr} (engine host: {engine_host}, fragments: {}, linger: encoder {}s, engine {}s)",
         frag_duration_ms
             .map(|ms| format!("{ms}ms"))
-            .unwrap_or_else(|| "keyframe".into())
+            .unwrap_or_else(|| "keyframe".into()),
+        encoder_linger.as_secs(),
+        engine_linger.as_secs(),
     ));
 
     for stream in listener.incoming() {
@@ -109,6 +118,17 @@ fn env_or(key: &str, fallback: &str) -> String {
     match std::env::var(key) {
         Ok(v) if !v.is_empty() => v,
         _ => fallback.to_owned(),
+    }
+}
+
+/// A whole number of seconds from the environment; 0 disables the feature.
+fn env_seconds(key: &str, default_secs: u64) -> Duration {
+    match env_or(key, &default_secs.to_string()).parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        Err(_) => {
+            log::error(&format!("{key} must be a non-negative number of seconds"));
+            std::process::exit(1);
+        }
     }
 }
 
@@ -156,14 +176,13 @@ fn handle(registry: &Arc<Registry>, request: Request, started: Instant) {
                     .with_header("Access-Control-Allow-Origin", "*"),
             );
         }
-        _ => reply(
-            request,
-            200,
-            "usage:\n  GET /audio?id=<40-hex content id>[&fmt=adts|mp3]\n  \
-             GET /video?id=<40-hex content id>\n  GET /status\n",
-        ),
+        "/" => reply(request, 200, USAGE),
+        _ => reply(request, 404, USAGE),
     }
 }
+
+const USAGE: &str = "usage:\n  GET /audio?id=<40-hex content id>[&fmt=adts|mp3]\n  \
+                     GET /video?id=<40-hex content id>\n  GET /status\n";
 
 fn reply(request: Request, code: u16, body: &str) {
     request.respond(
@@ -205,14 +224,9 @@ fn serve_stream(registry: &Arc<Registry>, request: Request, url: &str, path: &st
         }
     };
 
-    let sub = match registry.subscribe(&id, fmt, &peer) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error(&format!("{peer}: {id}/{fmt}: {e}"));
-            return reply(request, 502, &format!("could not start stream: {e}"));
-        }
-    };
-
+    // Answered before anything is started. Players commonly probe with a HEAD
+    // before the GET; subscribing here would start an engine pull and an
+    // ffmpeg, wait for a first fragment, and tear the lot down again.
     if request.method() == "HEAD" {
         request.respond(
             Response::empty(200)
@@ -221,6 +235,17 @@ fn serve_stream(registry: &Arc<Registry>, request: Request, url: &str, path: &st
         );
         return;
     }
+
+    // The fan-out gets its own handle on the socket so that evicting this
+    // listener also unblocks a write it may be stuck in.
+    let kick = request.socket_handle();
+    let sub = match registry.subscribe(&id, fmt, &peer, kick) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error(&format!("{peer}: {id}/{fmt}: {e}"));
+            return reply(request, 502, &format!("could not start stream: {e}"));
+        }
+    };
 
     log::info(&format!("{peer}: streaming {id} as {fmt}"));
     let counter = sub.counter();
@@ -243,9 +268,9 @@ fn serve_stream(registry: &Arc<Registry>, request: Request, url: &str, path: &st
 /// keep-alive, which is worthless when a connection carries exactly one
 /// hours-long stream.
 ///
-/// It also puts flushing under our control, which is what makes the low-latency
-/// ffmpeg flags meaningful end to end. The socket is unbuffered for the same
-/// reason — see `http::Request::read`.
+/// It also keeps the socket unbuffered, which is what makes the low-latency
+/// ffmpeg flags meaningful end to end: every chunk the encoder emits is one
+/// `write` straight to the kernel — see `http::Request::read`.
 fn stream_body(request: Request, fmt: OutputFormat, mut sub: Subscription) {
     let head = format!(
         "HTTP/1.1 200 OK\r\n\
@@ -258,7 +283,7 @@ fn stream_body(request: Request, fmt: OutputFormat, mut sub: Subscription) {
     );
 
     let mut w = request.into_writer();
-    if w.write_all(head.as_bytes()).is_err() || w.flush().is_err() {
+    if w.write_all(head.as_bytes()).is_err() {
         return;
     }
 
@@ -266,15 +291,12 @@ fn stream_body(request: Request, fmt: OutputFormat, mut sub: Subscription) {
     loop {
         match sub.read(&mut buf) {
             Ok(0) => break,
+            // A write error — the client gone, its write timeout expired, or
+            // the fan-out having shut the socket on eviction — is how a
+            // departed client is noticed; the Subscription drop that follows
+            // deregisters it and starts the encoder's linger if it was last.
             Ok(n) => {
-                // A write error is how a departed client is noticed; the
-                // Subscription drop that follows tears down anything it was the
-                // last listener for.
                 if w.write_all(&buf[..n]).is_err() {
-                    break;
-                }
-                // Flush per chunk: buffering here would undo -flush_packets.
-                if w.flush().is_err() {
                     break;
                 }
             }
