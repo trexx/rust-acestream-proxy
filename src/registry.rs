@@ -199,6 +199,11 @@ impl EngineStream {
         lock(&self.encoders).is_empty()
     }
 
+    /// Time since the source's video content clock last advanced, for /status.
+    pub fn live_edge_age(&self) -> Option<Duration> {
+        lock(&self.replay).live_edge_age()
+    }
+
     fn wait_ready(&self) -> Result<(), String> {
         let (lk, cv) = &self.start;
         let mut state = lock(lk);
@@ -531,6 +536,11 @@ pub struct Encoder {
     pub bytes_out: AtomicU64,
     pub video: format::TrackMode,
     pub audio: format::TrackMode,
+    /// Content-seconds behind the live edge at which this encoder was primed
+    /// (its newest-keyframe lag at start). A copy encoder holds this offset,
+    /// so it is roughly how far behind live its listeners sit. `None` when it
+    /// could not be primed from a keyframe. Reported by /status.
+    pub primed_behind_live: Option<Duration>,
     /// Cached fMP4 init segment, replayed to every late joiner. Joiners block
     /// on `init_ready` until the first `moof` has been written.
     init: Mutex<Option<Bytes>>,
@@ -963,6 +973,13 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
         .probe()
         .ok_or_else(|| "engine stream has no probe result".to_string())?;
     let (video, audio) = format::modes(fmt, probe.audio.as_deref());
+    // How far behind live this encoder starts, for /status. Only meaningful
+    // for video, which is primed from a keyframe; audio has no keyframe lag.
+    let primed_behind_live = if fmt.has_video() {
+        lock(&stream.replay).newest_keyframe_lag()
+    } else {
+        None
+    };
 
     let encoder = Arc::new(Encoder {
         content_id: stream.content_id.clone(),
@@ -971,6 +988,7 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
         bytes_out: AtomicU64::new(0),
         video,
         audio,
+        primed_behind_live,
         init: Mutex::new(None),
         init_ready: Condvar::new(),
         unjoinable: AtomicBool::new(false),
@@ -1212,6 +1230,7 @@ mod tests {
             bytes_out: AtomicU64::new(0),
             video: TrackMode::Copy,
             audio: TrackMode::Copy,
+            primed_behind_live: None,
             init: Mutex::new(None),
             init_ready: Condvar::new(),
             unjoinable: AtomicBool::new(false),
