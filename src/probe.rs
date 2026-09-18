@@ -1,8 +1,12 @@
-//! Source codec detection.
+//! Source codec detection, the slow way.
 //!
-//! The probe runs against a buffered preroll of the shared engine pull rather
-//! than opening its own connection to the engine, so it costs no extra engine
-//! session and happens once per content id instead of once per listener.
+//! The usual way is the PMT: `ts::Scanner` names the program's streams from
+//! the first packets of the pull, with no process spawned and nothing to wait
+//! for. ffprobe is the fallback for a stream it cannot name — a private
+//! stream with no descriptor it knows — and runs against a buffered preroll
+//! of the shared pull rather than opening its own connection to the engine,
+//! so even then it costs no extra engine session and happens once per content
+//! id instead of once per listener.
 
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
@@ -12,6 +16,15 @@ use std::thread;
 pub struct Probe {
     pub video: Option<String>,
     pub audio: Option<String>,
+}
+
+impl From<crate::ts::Program> for Probe {
+    fn from(p: crate::ts::Program) -> Probe {
+        Probe {
+            video: p.video.map(str::to_owned),
+            audio: p.audio.map(str::to_owned),
+        }
+    }
 }
 
 /// Parse `ffprobe -of json` output into the first codec of each type.

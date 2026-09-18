@@ -107,6 +107,12 @@ impl Replay {
         self.chunks.front().map_or(self.head, |c| c.start)
     }
 
+    /// What the stream carries, once the scanner has settled it. See
+    /// `ts::Scanner::program`.
+    pub fn program(&self) -> Option<ts::Program> {
+        self.scanner.program()
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.bytes

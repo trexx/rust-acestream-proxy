@@ -28,7 +28,7 @@ So a second listener costs the engine nothing, whether or not they want the same
 
 Not on the spot, though. A reconnect is the common case for a live viewer — a phone changing networks, a player restarting, a listener evicted for falling behind — and a cold start costs the engine's swarm discovery, typically 10–25 s. So an encoder **lingers** for `ENCODER_LINGER_S` (default 15) after its last listener leaves, and an engine pull for `ENGINE_LINGER_S` (default 60) after its last encoder stops. A viewer who comes back inside that window joins the running ffmpeg — measured, the init segment arrived in 30 ms — and one who comes back a little later still skips swarm discovery. `/status` shows what is lingering.
 
-The source is probed **once** per content id, on a buffer of the shared pull, so listeners after the first start with no probe delay at all.
+The source is identified **once** per content id, from the PMT in the first packets of the pull — no ffprobe, no preroll to wait for — so the first listener starts as soon as the engine sends anything and later ones with no delay at all. MPEG audio's layer, which the PMT does not carry and which decides whether `fmt=mp3` copies or transcodes, is read from the first frame header. ffprobe remains only as a fallback, over a 256 KB preroll, for a private stream the parser cannot name.
 
 ## Copy-first design
 

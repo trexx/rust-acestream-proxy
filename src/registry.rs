@@ -58,8 +58,8 @@ use crate::replay::{Policy, Replay};
 /// Read size for the engine pull and for ffmpeg output. A pipe read returns as
 /// soon as any data is there, so this is an upper bound, not a batching delay.
 const CHUNK: usize = 64 * 1024;
-/// Bytes buffered from the engine before probing. Sized to match ffprobe's
-/// `-probesize`.
+/// How much of the engine stream ffprobe gets when the PMT could not name the
+/// source. Sized to match ffprobe's `-probesize`.
 const PREROLL: usize = 256 * 1024;
 /// Per-encoder raw-TS backlog. Bounded deliberately small: the response to a
 /// full queue is backpressure onto the engine socket, not buffering.
@@ -318,31 +318,15 @@ fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
         }
     }
 
-    // Buffer a preroll and probe it. This is the only probe: every format and
-    // every later listener reuses the result, so it costs one engine read
-    // window per content id rather than one per request.
-    let mut preroll = vec![0u8; PREROLL];
-    let mut filled = 0usize;
-    while filled < PREROLL {
-        match resp.body.read(&mut preroll[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) => {
-                if let Some(s) = stream.upgrade() {
-                    s.publish(Err(format!("engine stream failed during preroll: {e}")));
-                }
-                stop_engine();
-                return;
-            }
-        }
-    }
-    preroll.truncate(filled);
-
-    let probed = match crate::probe::run(&preroll) {
-        Ok(p) => p,
+    // Identify the source from its PMT as the first packets arrive. Every
+    // format and every later listener reuses the answer. ffprobe over a
+    // preroll is only the fallback, for a stream the scanner cannot name.
+    let mut buf = vec![0u8; CHUNK];
+    let (probed, how) = match identify(&mut resp.body, &stream, &mut buf) {
+        Ok(found) => found,
         Err(e) => {
             if let Some(s) = stream.upgrade() {
-                s.publish(Err(format!("could not probe stream: {e}")));
+                s.publish(Err(e));
             }
             stop_engine();
             return;
@@ -356,18 +340,12 @@ fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
         };
         let _ = s.session.set(session);
         log::info(&format!(
-            "{}: engine stream up, video={} audio={}",
+            "{}: engine stream up, video={} audio={} ({how})",
             content_id,
             probed.video.as_deref().unwrap_or("none"),
             probed.audio.as_deref().unwrap_or("none"),
         ));
         let _ = s.probe.set(probed);
-        // The preroll is contiguous with what follows — same socket, no gap —
-        // so it seeds the replay window like any other chunk. It also carries
-        // the PAT/PMT the keyframe scanner needs before it can report anything.
-        s.bytes_in
-            .fetch_add(preroll.len() as u64, Ordering::Relaxed);
-        lock(&s.replay).push(Bytes::from(preroll));
         s.publish(Ok(()));
     }
 
@@ -428,6 +406,52 @@ fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
     }
 
     stop_engine();
+}
+
+/// Read from the engine until the source is identified, feeding the replay
+/// window as we go so nothing read here is lost to the encoders.
+///
+/// The PMT settles it within the first packets. If it has not by
+/// [`PREROLL`] bytes — a first audio stream the scanner cannot name — ffprobe
+/// gets what was read so far.
+fn identify(
+    body: &mut impl Read,
+    stream: &Weak<EngineStream>,
+    buf: &mut [u8],
+) -> Result<(Probe, String), String> {
+    let mut preroll: Vec<u8> = Vec::new();
+    loop {
+        let n = match body.read(buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return Err(format!("engine stream failed during preroll: {e}")),
+        };
+        let s = stream.upgrade().ok_or("stream torn down during startup")?;
+        s.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
+        let chunk = Bytes::copy_from_slice(&buf[..n]);
+        if preroll.len() < PREROLL {
+            preroll.extend_from_slice(&chunk);
+        }
+        let program = {
+            let mut replay = lock(&s.replay);
+            replay.push(chunk);
+            replay.program()
+        };
+        if let Some(p) = program {
+            return Ok((
+                Probe::from(p),
+                format!("from the PMT, {} bytes in", preroll.len()),
+            ));
+        }
+        if preroll.len() >= PREROLL {
+            break;
+        }
+    }
+    if preroll.is_empty() {
+        return Err("engine stream ended before sending anything".into());
+    }
+    let probed = crate::probe::run(&preroll).map_err(|e| format!("could not probe stream: {e}"))?;
+    Ok((probed, format!("ffprobe over {} bytes", preroll.len())))
 }
 
 /// Hand a chunk to one encoder, waiting for room rather than giving up.
