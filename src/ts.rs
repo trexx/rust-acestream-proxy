@@ -40,6 +40,17 @@ pub struct Program {
     pub audio: Option<&'static str>,
 }
 
+/// A transport packet that begins a video keyframe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keyframe {
+    /// Absolute offset of the packet, counted from the first byte ever fed.
+    pub at: u64,
+    /// The keyframe's presentation timestamp on the 90 kHz clock, if the PES
+    /// carried one. Paired with [`Scanner::latest_video_pts`], this gives the
+    /// content duration buffered after the keyframe.
+    pub pts: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Video {
     pid: u16,
@@ -115,6 +126,9 @@ pub struct Scanner {
     pmt_seen: bool,
     video: Option<Video>,
     audio: Option<(u16, Audio)>,
+    /// The most recent presentation timestamp seen on the video PID, i.e. the
+    /// content clock at the live edge.
+    latest_video_pts: Option<u64>,
 }
 
 impl Scanner {
@@ -126,6 +140,16 @@ impl Scanner {
     #[cfg(test)]
     pub fn video_codec(&self) -> Option<Codec> {
         self.video.map(|v| v.codec)
+    }
+
+    /// Whether the PMT named a video stream. Known once the PMT is seen.
+    pub fn has_video(&self) -> bool {
+        self.video.is_some()
+    }
+
+    /// The content clock at the live edge: the newest video PTS seen.
+    pub fn latest_video_pts(&self) -> Option<u64> {
+        self.latest_video_pts
     }
 
     /// What the program carries, once that is settled: the PMT has been seen
@@ -147,13 +171,14 @@ impl Scanner {
         })
     }
 
-    /// Consume `data` and return the absolute offsets (counted from the first
-    /// byte ever fed) of every transport packet that begins a video keyframe.
+    /// Consume `data` and return a [`Keyframe`] for every transport packet
+    /// that begins a video keyframe, with offsets counted from the first byte
+    /// ever fed.
     ///
     /// Input need not be packet-aligned: the scanner resynchronises on a sync
     /// byte that is followed by another one packet later, as the mpegts demuxer
     /// does, and carries a trailing partial packet into the next call.
-    pub fn feed(&mut self, data: &[u8]) -> Vec<u64> {
+    pub fn feed(&mut self, data: &[u8]) -> Vec<Keyframe> {
         let owned;
         let buf: &[u8] = if self.carry.is_empty() {
             data
@@ -170,8 +195,11 @@ impl Scanner {
                 i += 1; // resync a byte at a time
                 continue;
             }
-            if self.packet(&buf[i..next]) {
-                found.push(base + i as u64);
+            if let Some(pts) = self.packet(&buf[i..next]) {
+                found.push(Keyframe {
+                    at: base + i as u64,
+                    pts,
+                });
             }
             i = next;
         }
@@ -180,8 +208,10 @@ impl Scanner {
         found
     }
 
-    /// Handle one 188-byte packet; true if it starts a video keyframe.
-    fn packet(&mut self, p: &[u8]) -> bool {
+    /// Handle one 188-byte packet. `Some(pts)` if it starts a video keyframe,
+    /// where `pts` is the keyframe's presentation timestamp if the PES carried
+    /// one; `None` otherwise. Updates the live-edge video PTS as a side effect.
+    fn packet(&mut self, p: &[u8]) -> Option<Option<u64>> {
         let pid = (u16::from(p[1] & 0x1F) << 8) | u16::from(p[2]);
         let pusi = p[1] & 0x40 != 0;
         let afc = (p[3] >> 4) & 0x3;
@@ -195,7 +225,7 @@ impl Scanner {
             off = 5 + len;
         }
         if afc & 0x1 == 0 || off >= PACKET {
-            return false;
+            return None;
         }
         let payload = &p[off..];
 
@@ -203,28 +233,34 @@ impl Scanner {
             if let Some(section) = self.pat.feed(pusi, payload) {
                 self.parse_pat(&section);
             }
-            return false;
+            return None;
         }
         if Some(pid) == self.pmt_pid {
             if let Some(section) = self.pmt.feed(pusi, payload) {
                 self.parse_pmt(&section);
             }
-            return false;
+            return None;
         }
         if !pusi {
-            return false;
+            return None;
         }
         if let Some((apid, Audio::MpegLayer)) = self.audio {
             if apid == pid {
                 if let Some(name) = mpeg_audio_layer(payload) {
                     self.audio = Some((pid, Audio::Known(name)));
                 }
-                return false;
+                return None;
             }
         }
         match self.video {
-            Some(v) if v.pid == pid => keyframe(v.codec, payload).unwrap_or(rai),
-            _ => false,
+            Some(v) if v.pid == pid => {
+                let pts = pes_pts(payload);
+                if pts.is_some() {
+                    self.latest_video_pts = pts;
+                }
+                keyframe(v.codec, payload).unwrap_or(rai).then_some(pts)
+            }
+            _ => None,
         }
     }
 
@@ -326,6 +362,26 @@ fn classify(stream_type: u8, es_info: &[u8]) -> Kind {
         }
         _ => Kind::Other,
     }
+}
+
+/// The 33-bit PTS of a PES-start packet on the 90 kHz clock, if it carries one.
+fn pes_pts(payload: &[u8]) -> Option<u64> {
+    if payload.len() < 14 || payload[..3] != [0, 0, 1] {
+        return None;
+    }
+    // PTS_DTS_flags live in the high two bits of byte 7; either value (PTS
+    // only, or PTS and DTS) puts the PTS in bytes 9..14.
+    if payload[7] & 0x80 == 0 {
+        return None;
+    }
+    let b = &payload[9..14];
+    Some(
+        (u64::from(b[0] >> 1 & 0x07) << 30)
+            | (u64::from(b[1]) << 22)
+            | (u64::from(b[2] >> 1 & 0x7F) << 15)
+            | (u64::from(b[3]) << 7)
+            | u64::from(b[4] >> 1 & 0x7F),
+    )
 }
 
 /// The elementary stream bytes of a PES-start packet, past the PES header.
@@ -474,9 +530,24 @@ pub(crate) mod fixtures {
         pmt_with(pmt_pid, &with)
     }
 
-    /// A PES-start packet whose elementary stream begins with `es`.
+    /// A PES-start packet whose elementary stream begins with `es`. Carries a
+    /// PTS of 0.
     pub fn pes(pid: u16, rai: Option<bool>, es: &[u8]) -> Vec<u8> {
-        let mut payload = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0x80, 5, 0x21, 0, 1, 0, 1];
+        pes_at(pid, 0, rai, es)
+    }
+
+    /// A PES-start packet carrying an explicit 90 kHz PTS.
+    pub fn pes_at(pid: u16, pts: u64, rai: Option<bool>, es: &[u8]) -> Vec<u8> {
+        let p = pts & ((1 << 33) - 1);
+        let ts = [
+            0x20 | ((p >> 29) & 0x0E) as u8 | 0x01,
+            (p >> 22) as u8,
+            (((p >> 14) & 0xFE) as u8) | 0x01,
+            (p >> 7) as u8,
+            (((p << 1) & 0xFE) as u8) | 0x01,
+        ];
+        let mut payload = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0x80, 5];
+        payload.extend_from_slice(&ts);
         payload.extend_from_slice(es);
         packet(pid, true, rai, &payload)
     }
@@ -499,6 +570,11 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    /// The keyframe offsets, for the many tests that only care where they fell.
+    fn ats(kfs: Vec<Keyframe>) -> Vec<u64> {
+        kfs.iter().map(|k| k.at).collect()
+    }
 
     fn program_of(data: &[u8]) -> Option<Program> {
         let mut s = Scanner::new();
@@ -533,8 +609,87 @@ mod tests {
             None,
             &[AUD.as_slice(), SEI.as_slice(), IDR.as_slice()].concat(),
         ));
-        assert_eq!(s.feed(&data), vec![at_sps, at_idr]);
+        assert_eq!(ats(s.feed(&data)), vec![at_sps, at_idr]);
         assert_eq!(s.video_codec(), Some(Codec::H264));
+    }
+
+    #[test]
+    fn tracks_video_pts_and_tags_keyframes() {
+        let (mut s, mut data) = h264_stream();
+        assert_eq!(s.latest_video_pts(), None);
+        let at = data.len() as u64;
+        // A keyframe at 10 s, then a non-keyframe slice at 11 s.
+        data.extend(pes_at(
+            0x101,
+            900_000,
+            None,
+            &[AUD.as_slice(), SPS.as_slice(), IDR.as_slice()].concat(),
+        ));
+        data.extend(pes_at(
+            0x101,
+            990_000,
+            None,
+            &[AUD.as_slice(), SLICE.as_slice()].concat(),
+        ));
+        assert_eq!(
+            s.feed(&data),
+            vec![Keyframe {
+                at,
+                pts: Some(900_000)
+            }]
+        );
+        assert_eq!(
+            s.latest_video_pts(),
+            Some(990_000),
+            "the clock advances past the keyframe"
+        );
+    }
+
+    #[test]
+    fn pts_survives_a_33_bit_value() {
+        let (mut s, mut data) = h264_stream();
+        let big = (1u64 << 33) - 1;
+        data.extend(pes_at(
+            0x101,
+            big,
+            None,
+            &[AUD.as_slice(), SPS.as_slice(), IDR.as_slice()].concat(),
+        ));
+        assert_eq!(s.feed(&data).first().and_then(|k| k.pts), Some(big));
+    }
+
+    #[test]
+    fn audio_pts_does_not_touch_the_video_clock() {
+        let (mut s, mut data) = h264_stream();
+        data.extend(pes_at(0x102, 5_000_000, None, &[0xFF; 8]));
+        s.feed(&data);
+        assert_eq!(s.latest_video_pts(), None, "only the video PID sets it");
+    }
+
+    #[test]
+    fn a_video_pes_without_a_pts_flag_tags_the_keyframe_none() {
+        let (mut s, mut data) = h264_stream();
+        // PES-start with PTS_DTS_flags clear and no optional fields.
+        let mut payload = vec![0, 0, 1, 0xE0, 0, 0, 0x80, 0x00, 0];
+        payload.extend_from_slice(&[AUD.as_slice(), SPS.as_slice(), IDR.as_slice()].concat());
+        let at = data.len() as u64;
+        data.extend(packet(0x101, true, None, &payload));
+        assert_eq!(s.feed(&data), vec![Keyframe { at, pts: None }]);
+        assert_eq!(s.latest_video_pts(), None);
+    }
+
+    #[test]
+    fn has_video_reflects_the_pmt() {
+        let mut s = Scanner::new();
+        assert!(!s.has_video());
+        let (_, data) = h264_stream();
+        s.feed(&data);
+        assert!(s.has_video());
+
+        let mut s = Scanner::new();
+        s.feed(&pat(0x100));
+        s.feed(&pmt(0x100, &[(0x0F, 0x102)]));
+        assert!(!s.has_video(), "an audio-only program has no video");
     }
 
     #[test]
@@ -564,7 +719,7 @@ mod tests {
             Some(false),
             &[AUD.as_slice(), SEI.as_slice()].concat(),
         ));
-        assert_eq!(s.feed(&data), vec![at]);
+        assert_eq!(ats(s.feed(&data)), vec![at]);
     }
 
     #[test]
@@ -586,7 +741,7 @@ mod tests {
         assert!(s.feed(&pkt).is_empty());
         let (_, tables) = h264_stream();
         s.feed(&tables);
-        assert_eq!(s.feed(&pkt), vec![(tables.len() + PACKET) as u64]);
+        assert_eq!(ats(s.feed(&pkt)), vec![(tables.len() + PACKET) as u64]);
     }
 
     #[test]
@@ -607,7 +762,11 @@ mod tests {
 
         for chunk in [1, 7, 100, 187, 188, 189, 1000] {
             let mut s = Scanner::new();
-            let found: Vec<u64> = data.chunks(chunk).flat_map(|c| s.feed(c)).collect();
+            let found: Vec<u64> = data
+                .chunks(chunk)
+                .flat_map(|c| s.feed(c))
+                .map(|k| k.at)
+                .collect();
             assert_eq!(found, vec![at], "chunk size {chunk}");
         }
     }
@@ -628,7 +787,7 @@ mod tests {
         data.extend([0x47, 0x00, 0x11]);
         let at = data.len() as u64;
         data.extend(&key);
-        assert_eq!(s.feed(&data), vec![tables.len() as u64 + at]);
+        assert_eq!(ats(s.feed(&data)), vec![tables.len() as u64 + at]);
     }
 
     #[test]
@@ -640,7 +799,7 @@ mod tests {
         data.extend(pes(0x101, None, &[0, 0, 0, 1, 0x40, 0x01]));
         data.extend(pes(0x101, None, &[0, 0, 0, 1, 0x02, 0x01]));
         let mut s = Scanner::new();
-        assert_eq!(s.feed(&data), vec![at]);
+        assert_eq!(ats(s.feed(&data)), vec![at]);
         assert_eq!(s.video_codec(), Some(Codec::Hevc));
 
         let mut data = pat(0x100);
@@ -649,7 +808,7 @@ mod tests {
         data.extend(pes(0x101, None, &[0, 0, 1, 0xB3, 0x14, 0x00])); // sequence header
         data.extend(pes(0x101, None, &[0, 0, 1, 0x00, 0x00, 0x10])); // P picture
         let mut s = Scanner::new();
-        assert_eq!(s.feed(&data), vec![at]);
+        assert_eq!(ats(s.feed(&data)), vec![at]);
     }
 
     #[test]
@@ -660,7 +819,7 @@ mod tests {
         data.extend(pes(0x101, Some(true), &[0xAA; 8]));
         data.extend(pes(0x101, Some(false), &[0xAA; 8]));
         let mut s = Scanner::new();
-        assert_eq!(s.feed(&data), vec![at]);
+        assert_eq!(ats(s.feed(&data)), vec![at]);
         assert_eq!(s.video_codec(), Some(Codec::Other));
     }
 
@@ -955,7 +1114,11 @@ mod tests {
             _ => return, // no usable ffmpeg here
         };
         let mut s = Scanner::new();
-        let found: Vec<u64> = out.chunks(64 * 1024 + 13).flat_map(|c| s.feed(c)).collect();
+        let found: Vec<u64> = out
+            .chunks(64 * 1024 + 13)
+            .flat_map(|c| s.feed(c))
+            .map(|k| k.at)
+            .collect();
         assert_eq!(found.len(), 4, "keyframes at {found:?}");
         for at in found {
             let p = &out[at as usize..at as usize + PACKET];

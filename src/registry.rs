@@ -96,6 +96,19 @@ const REPLAY_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Raw TS replayed into a new audio encoder: its 1s analysis window plus
 /// margin, from wherever that lands. Audio needs no keyframe.
 const AUDIO_TAIL: Duration = Duration::from_millis(1500);
+/// Content a cold video encoder is primed with when the window can supply it:
+/// the keyframe-start analysis window (2s, see `format::probe_window`) plus
+/// margin so ffmpeg's analysis completes from the buffer. Also the encoder's
+/// steady lag behind live, so kept as small as the analysis allows.
+const PRIME_CONTENT: Duration = Duration::from_millis(2500);
+/// How long the first video encoder on a cold pull will wait for the window to
+/// reach `PRIME_CONTENT`. Only spent while the engine is bursting faster than
+/// real time (which is what makes the wait pay off); a real-time source stops
+/// it after `BURST_SAMPLE`, so it never delays startup beyond that.
+const PRIME_WAIT: Duration = Duration::from_secs(3);
+/// The shortest window over which "arriving faster than real time" is judged,
+/// and so the most a non-bursting source is ever delayed by the wait above.
+const BURST_SAMPLE: Duration = Duration::from_millis(150);
 
 /// Lock, recovering from poisoning. A request thread that panics must not
 /// take every other listener's stream down with it — which is why the binary
@@ -163,6 +176,9 @@ pub struct EngineStream {
     stats: Mutex<Option<(Instant, serde_json::Value)>>,
     /// Trailing raw TS, from which each new encoder is primed.
     replay: Mutex<Replay>,
+    /// Signalled by the puller after each push, so a video encoder waiting for
+    /// the window to buffer enough to prime from a keyframe wakes promptly.
+    replay_progress: Condvar,
     encoders: Mutex<HashMap<OutputFormat, Feed>>,
     /// Serialises get-or-create so two simultaneous requests for the same
     /// format cannot both spawn an ffmpeg. Held only by would-be creators, so
@@ -197,6 +213,51 @@ impl EngineStream {
     /// True while the pull is being kept alive with no encoder on it.
     pub fn lingering(&self) -> bool {
         lock(&self.encoders).is_empty()
+    }
+
+    /// Append a chunk to the replay window and wake anyone waiting to prime.
+    fn feed_replay(&self, chunk: Bytes) {
+        lock(&self.replay).push(chunk);
+        self.replay_progress.notify_all();
+    }
+
+    /// Give the first video encoder on a cold pull a brief chance to start from
+    /// buffered content instead of waiting on live data. Returns as soon as the
+    /// window holds [`PRIME_CONTENT`] after a keyframe; or the source proves to
+    /// be arriving no faster than real time, so waiting cannot help; or
+    /// [`PRIME_WAIT`] elapses. A warm encoder, an audio format, or a source
+    /// with no video track skip it entirely.
+    fn wait_video_prime(&self, fmt: OutputFormat) {
+        if !fmt.has_video() || lock(&self.encoders).contains_key(&fmt) {
+            return;
+        }
+        let mut replay = lock(&self.replay);
+        if !replay.has_video() {
+            return; // nothing to align to; audio-only inside an fMP4 request
+        }
+        let start = Instant::now();
+        let base = replay.latest_video_pts();
+        loop {
+            if replay.video_prime_ready(PRIME_CONTENT) {
+                return;
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= PRIME_WAIT {
+                return;
+            }
+            // Keep waiting only while content is arriving faster than it plays:
+            // that burst is what lets the window reach PRIME_CONTENT in a
+            // fraction of the wall time. A real-time source gains nothing.
+            if elapsed >= BURST_SAMPLE && replay.content_growth(base) <= elapsed {
+                return;
+            }
+            let left = PRIME_WAIT.saturating_sub(elapsed).min(BURST_SAMPLE);
+            let (g, _) = self
+                .replay_progress
+                .wait_timeout(replay, left)
+                .unwrap_or_else(|e| e.into_inner());
+            replay = g;
+        }
     }
 
     fn wait_ready(&self) -> Result<(), String> {
@@ -376,7 +437,7 @@ fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
         let Some(s) = stream.upgrade() else { break };
         s.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
         let chunk = Bytes::copy_from_slice(&buf[..n]);
-        lock(&s.replay).push(chunk.clone());
+        s.feed_replay(chunk.clone());
 
         // Snapshot the senders so the lock is not held across a blocking send.
         // Never upgrade the Weak<Encoder> here either: dropping the last Arc
@@ -437,6 +498,7 @@ fn identify(
             replay.push(chunk);
             replay.program()
         };
+        s.replay_progress.notify_all();
         if let Some(p) = program {
             return Ok((
                 Probe::from(p),
@@ -893,6 +955,7 @@ impl Registry {
                         socket: OnceLock::new(),
                         stats: Mutex::new(None),
                         replay: Mutex::new(Replay::new(REPLAY_MAX_AGE, REPLAY_MAX_BYTES)),
+                        replay_progress: Condvar::new(),
                         encoders: Mutex::new(HashMap::new()),
                         creating: Mutex::new(()),
                         start: (Mutex::new(Start::Pending), Condvar::new()),
@@ -929,6 +992,11 @@ impl Registry {
         kick: Option<TcpStream>,
     ) -> Result<Subscription, String> {
         let stream = self.engine_stream(content_id)?;
+        // For the first video encoder, let a start-up burst fill the replay
+        // window first, so ffmpeg can be primed from a keyframe with its
+        // analysis content already buffered instead of waiting on live data.
+        // Held before `creating` so a concurrent audio request is not blocked.
+        stream.wait_video_prime(fmt);
         // The Arc is held across subscribe, so the encoder cannot be torn down
         // underneath a joiner waiting for its first fragment.
         get_or_start_encoder(&stream, fmt)?.subscribe(peer.to_owned(), kick)
@@ -990,7 +1058,7 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
     // since the analysis window depends on what the snapshot starts with; the
     // queue simply fills for the few milliseconds that takes.
     let policy = if fmt.has_video() {
-        Policy::FromKeyframe
+        Policy::FromKeyframe(PRIME_CONTENT)
     } else {
         Policy::Tail(AUDIO_TAIL)
     };
@@ -1192,6 +1260,7 @@ mod tests {
             socket: OnceLock::new(),
             stats: Mutex::new(None),
             replay: Mutex::new(Replay::new(REPLAY_MAX_AGE, REPLAY_MAX_BYTES)),
+            replay_progress: Condvar::new(),
             encoders: Mutex::new(HashMap::new()),
             creating: Mutex::new(()),
             start: (Mutex::new(Start::Ready), Condvar::new()),
@@ -1509,6 +1578,93 @@ mod tests {
         assert_eq!(
             send_backpressured(&tx, &fed, Bytes::from_static(b"y")),
             Err("gone")
+        );
+    }
+
+    #[test]
+    fn wait_video_prime_does_not_block_audio_or_a_video_less_source() {
+        let engine = test_engine(); // empty replay: no video track known
+        let began = Instant::now();
+        engine.wait_video_prime(OutputFormat::Fmp4);
+        engine.wait_video_prime(OutputFormat::Adts);
+        assert!(began.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn wait_video_prime_is_skipped_once_an_encoder_exists() {
+        let engine = test_engine();
+        let enc = test_encoder_on(engine.clone(), OutputFormat::Fmp4);
+        let (tx, _rx) = sync_channel::<Bytes>(TS_QUEUE);
+        lock(&engine.encoders).insert(
+            OutputFormat::Fmp4,
+            Feed {
+                encoder: Arc::downgrade(&enc),
+                tx,
+                fed: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        let began = Instant::now();
+        engine.wait_video_prime(OutputFormat::Fmp4); // warm: reused as-is
+        assert!(began.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn wait_video_prime_returns_at_once_when_the_window_can_prime() {
+        use crate::ts::fixtures::*;
+        let engine = test_engine();
+        {
+            let mut r = lock(&engine.replay);
+            let (_, tables) = h264_stream();
+            r.push(Bytes::from(tables));
+            r.push(Bytes::from(pes_at(
+                0x101,
+                0,
+                None,
+                &[AUD.as_slice(), SPS.as_slice(), IDR.as_slice()].concat(),
+            )));
+            // Live edge well past PRIME_CONTENT behind a keyframe.
+            r.push(Bytes::from(pes_at(
+                0x101,
+                3 * 90_000,
+                None,
+                &[AUD.as_slice(), SLICE.as_slice()].concat(),
+            )));
+            assert!(r.video_prime_ready(PRIME_CONTENT));
+        }
+        let began = Instant::now();
+        engine.wait_video_prime(OutputFormat::Fmp4);
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "already primeable"
+        );
+    }
+
+    #[test]
+    fn wait_video_prime_gives_up_quickly_on_a_real_time_source() {
+        use crate::ts::fixtures::*;
+        let engine = test_engine();
+        {
+            // A video track and a keyframe, but no content after it, and no
+            // more arriving: the burst check must abandon the wait fast.
+            let mut r = lock(&engine.replay);
+            let (_, tables) = h264_stream();
+            r.push(Bytes::from(tables));
+            r.push(Bytes::from(pes_at(
+                0x101,
+                0,
+                None,
+                &[AUD.as_slice(), SPS.as_slice(), IDR.as_slice()].concat(),
+            )));
+            assert!(r.has_video());
+            assert!(!r.video_prime_ready(PRIME_CONTENT));
+        }
+        let began = Instant::now();
+        engine.wait_video_prime(OutputFormat::Fmp4);
+        let waited = began.elapsed();
+        assert!(waited >= BURST_SAMPLE, "samples the fill rate first");
+        assert!(
+            waited < PRIME_WAIT,
+            "but does not sit out the full cap: {waited:?}"
         );
     }
 
