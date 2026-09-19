@@ -1,0 +1,20 @@
+name: 'Test'
+
+on:
+  push:
+    branches: [ 'main' ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: 'actions/checkout@v4'
+      - uses: 'dtolnay/rust-toolchain@stable'
+        with:
+          components: 'clippy'
+      # The ffmpeg-backed tests skip themselves when no ffmpeg is present;
+      # installing one makes them run.
+      - run: 'sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg'
+      - run: 'cargo clippy --all-targets --locked -- -D warnings'
+      - run: 'cargo test --locked'
