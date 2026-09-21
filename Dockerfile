@@ -12,7 +12,7 @@ COPY src ./src
 # statically by default — the equivalent of the old CGO_ENABLED=0 build.
 RUN cargo build --release --locked
 
-FROM docker.io/mwader/static-ffmpeg:9.0.1-amd64@sha256:532d8d399fae7baba29b8fe120e49ae7ec7335e72e69ead51973b6728e3d40d1
+FROM docker.io/mwader/static-ffmpeg:9.0.2-amd64@sha256:73e53e0efe712c0dda05ec65c18e7185f2638c33293d62dd9d541b081c0b523d
 LABEL org.opencontainers.image.source="https://github.com/trexx/rust-acestream-proxy"
 
 # The base image ships /ffmpeg and /ffprobe at the filesystem root; the service
