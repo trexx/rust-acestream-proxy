@@ -358,10 +358,7 @@ impl EngineStream {
         };
         for (fmt, feed, why) in removed {
             if why == Wedged::Stalled {
-                log::error(&format!(
-                    "{}/{fmt}: encoder {why}; torn down",
-                    self.content_id
-                ));
+                log::error!("{}/{fmt}: encoder {why}; torn down", self.content_id);
                 // Upgraded only now, outside the lock: see the locking rule.
                 if let Some(enc) = feed.encoder.upgrade() {
                     enc.kill();
@@ -379,7 +376,7 @@ impl Drop for EngineStream {
         if let Some(s) = self.socket.get() {
             let _ = s.shutdown(Shutdown::Both);
         }
-        log::info(&format!("{}: engine stream closed", self.content_id));
+        log::info!("{}: engine stream closed", self.content_id);
     }
 }
 
@@ -391,11 +388,11 @@ fn linger_engine(stream: Arc<EngineStream>) {
     if d.is_zero() || stream.ended() {
         return;
     }
-    log::info(&format!(
+    log::info!(
         "{}: no encoders; keeping the engine pull for {}s",
         stream.content_id,
         d.as_secs()
-    ));
+    );
     linger::hold(stream, d);
 }
 
@@ -446,11 +443,11 @@ fn relay(stream: &Weak<EngineStream>, content_id: &str, session: Session) -> Res
     {
         let s = stream.upgrade().ok_or_else(gone)?;
         let _ = s.session.set(session);
-        log::info(&format!(
+        log::info!(
             "{content_id}: engine stream up, video={} audio={} ({how})",
             probed.video.as_deref().unwrap_or("none"),
             probed.audio.as_deref().unwrap_or("none"),
-        ));
+        );
         let _ = s.probe.set(probed);
         s.publish(Ok(()));
     }
@@ -459,7 +456,7 @@ fn relay(stream: &Weak<EngineStream>, content_id: &str, session: Session) -> Res
     loop {
         let n = match resp.body.read(&mut buf) {
             Ok(0) => {
-                log::info(&format!("{content_id}: engine closed the stream"));
+                log::info!("{content_id}: engine closed the stream");
                 break;
             }
             Ok(n) => n,
@@ -470,7 +467,7 @@ fn relay(stream: &Weak<EngineStream>, content_id: &str, session: Session) -> Res
                 // puller stops promptly — and that is not a failure worth
                 // reporting. If the stream is already gone, this is that.
                 if stream.upgrade().is_some() {
-                    log::warn(&format!("{content_id}: engine read failed: {e}"));
+                    log::warn!("{content_id}: engine read failed: {e}");
                 }
                 break;
             }
@@ -878,14 +875,14 @@ impl Encoder {
                 now.saturating_sub(l.oldest_unread.max(l.consumed_at.load(Ordering::Relaxed))),
             );
             if behind > SUB_MAX_LAG || queued + data.len() > SUB_MAX_BYTES {
-                log::warn(&format!(
+                log::warn!(
                     "{}/{}: {} fell {:.1}s and {}KB behind; disconnecting",
                     self.content_id,
                     self.fmt,
                     l.peer,
                     behind.as_secs_f64(),
                     queued / 1024
-                ));
+                );
                 l.kick();
                 return false;
             }
@@ -925,13 +922,13 @@ impl Drop for Encoder {
         }
         let last = map.is_empty();
         drop(map);
-        log::info(&format!(
+        log::info!(
             "{}/{}: encoder stopped after {}s, {} bytes",
             self.content_id,
             self.fmt,
             self.started.elapsed().as_secs(),
             self.bytes_out.load(Ordering::Relaxed)
-        ));
+        );
         if last {
             // Our Arc<EngineStream> is about to drop with us; hand the pull to
             // the linger instead of letting that close it.
@@ -1204,7 +1201,7 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
         .spawn(move || drain_ffmpeg(weak, stdout, fmt))
         .map_err(|e| format!("could not start drainer: {e}"))?;
 
-    log::info(&format!(
+    log::info!(
         "{}/{}: encoder started (video {}, audio {}, {} bytes replayed{})",
         stream.content_id,
         fmt,
@@ -1216,7 +1213,7 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
         } else {
             ""
         }
-    ));
+    );
     Ok(encoder)
 }
 
@@ -1272,10 +1269,11 @@ fn drain_ffmpeg(encoder: Weak<Encoder>, mut stdout: ChildStdout, fmt: OutputForm
                 if s.failed() {
                     if !gave_up {
                         gave_up = true;
-                        log::error(&format!(
+                        log::error!(
                             "{}/{}: output is not valid fragmented mp4; late joiners refused",
-                            enc.content_id, fmt
-                        ));
+                            enc.content_id,
+                            fmt
+                        );
                         enc.set_output(Output::Unjoinable);
                     }
                 } else if !have_init {
@@ -1315,7 +1313,7 @@ fn spawn_stats_poller(reg: Weak<Registry>) {
                 let Some(s) = stream.upgrade() else { continue };
                 match polled {
                     Ok(v) => *lock(&s.stats) = Some(v),
-                    Err(e) => log::warn(&format!("{}: stat poll failed: {e}", s.content_id)),
+                    Err(e) => log::warn!("{}: stat poll failed: {e}", s.content_id),
                 }
             }
         })

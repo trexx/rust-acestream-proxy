@@ -333,9 +333,9 @@ pub fn open_session(engine_host: &str, content_id: &str, pid: &str) -> Result<Se
     let text = match get_text(&url, CONTROL_TIMEOUT) {
         Ok(t) => t,
         Err(e) => {
-            log::warn(&format!(
+            log::warn!(
                 "engine json handshake failed ({e}); falling back to a direct pull without stats"
-            ));
+            );
             return Ok(Session {
                 playback_url: direct,
                 stat_url: None,
@@ -352,9 +352,9 @@ pub fn open_session(engine_host: &str, content_id: &str, pid: &str) -> Result<Se
             if let Some(msg) = engine_error(&text) {
                 return Err(msg);
             }
-            log::warn(&format!(
+            log::warn!(
                 "engine json handshake unparsable ({e}); falling back to a direct pull without stats"
-            ));
+            );
             Ok(Session {
                 playback_url: direct,
                 stat_url: None,
@@ -419,7 +419,7 @@ pub fn send_stop(command_url: &str) {
     let sep = if command_url.contains('?') { '&' } else { '?' };
     let url = format!("{command_url}{sep}method=stop");
     if let Err(e) = get_text(&url, CONTROL_TIMEOUT) {
-        log::warn(&format!("engine stop command failed: {e}"));
+        log::warn!("engine stop command failed: {e}");
     }
 }
 

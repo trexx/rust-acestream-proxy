@@ -37,7 +37,7 @@ fn main() {
     let engine_host = match std::env::var("ENGINE_HOST") {
         Ok(v) if !v.is_empty() => v,
         _ => {
-            log::error("ENGINE_HOST must be set");
+            log::error!("ENGINE_HOST must be set");
             std::process::exit(1);
         }
     };
@@ -51,7 +51,7 @@ fn main() {
         Ok(0) => None,
         Ok(ms) => Some(ms),
         Err(_) => {
-            log::error("FRAG_DURATION_MS must be a non-negative integer");
+            log::error!("FRAG_DURATION_MS must be a non-negative integer");
             std::process::exit(1);
         }
     };
@@ -61,7 +61,7 @@ fn main() {
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
-            log::error(&format!("could not bind {addr}: {e}"));
+            log::error!("could not bind {addr}: {e}");
             std::process::exit(1);
         }
     };
@@ -74,14 +74,14 @@ fn main() {
     });
     let started = Instant::now();
 
-    log::info(&format!(
+    log::info!(
         "listening on {addr} (engine host: {engine_host}, fragments: {}, linger: encoder {}s, engine {}s)",
         frag_duration_ms
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| "keyframe".into()),
         encoder_linger.as_secs(),
         engine_linger.as_secs(),
-    ));
+    );
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -90,7 +90,7 @@ fn main() {
                 // One connection failing to arrive says nothing about the
                 // listener, which is still perfectly good. tiny_http shut the
                 // whole server down here, its open issue #283.
-                log::warn(&format!("could not accept a connection: {e}"));
+                log::warn!("could not accept a connection: {e}");
                 continue;
             }
         };
@@ -106,11 +106,11 @@ fn main() {
                 match Request::read(stream) {
                     Ok(request) => handle(&registry, request, started),
                     // The peer has already been answered; nothing else to do.
-                    Err(e) => log::warn(&format!("rejected a request: {e}")),
+                    Err(e) => log::warn!("rejected a request: {e}"),
                 }
             })
         {
-            log::error(&format!("could not spawn a request thread: {e}"));
+            log::error!("could not spawn a request thread: {e}");
         }
     }
 }
@@ -127,7 +127,7 @@ fn env_seconds(key: &str, default_secs: u64) -> Duration {
     match env_or(key, &default_secs.to_string()).parse::<u64>() {
         Ok(secs) => Duration::from_secs(secs),
         Err(_) => {
-            log::error(&format!("{key} must be a non-negative number of seconds"));
+            log::error!("{key} must be a non-negative number of seconds");
             std::process::exit(1);
         }
     }
@@ -239,22 +239,22 @@ fn serve_stream(registry: &Arc<Registry>, request: Request) {
     let sub = match registry.subscribe(&id, fmt, &peer, kick) {
         Ok(s) => s,
         Err(e) => {
-            log::error(&format!("{peer}: {id}/{fmt}: {e}"));
+            log::error!("{peer}: {id}/{fmt}: {e}");
             return reply(request, 502, &format!("could not start stream: {e}"));
         }
     };
 
-    log::info(&format!("{peer}: streaming {id} as {fmt}"));
+    log::info!("{peer}: streaming {id} as {fmt}");
     let counter = sub.counter();
     let start = Instant::now();
 
     stream_body(request, fmt, sub);
 
-    log::info(&format!(
+    log::info!(
         "{peer}: {id}/{fmt} ended after {}s, {} bytes sent",
         start.elapsed().as_secs(),
         counter.load(Ordering::Relaxed)
-    ));
+    );
 }
 
 /// Write the response head and body straight to the socket.

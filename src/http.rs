@@ -283,13 +283,13 @@ impl Request {
         // relied on Linux copying the flag from listener to accepted socket.
         // Doing it here is explicit and drops the last use of the libc crate.
         if stream.set_nodelay(true).is_err() {
-            log::warn("could not set TCP_NODELAY; expect added latency");
+            log::warn!("could not set TCP_NODELAY; expect added latency");
         }
         if let Err(e) = stream.set_read_timeout(Some(HEAD_TIMEOUT)) {
-            log::warn(&format!("could not set a read timeout: {e}"));
+            log::warn!("could not set a read timeout: {e}");
         }
         if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
-            log::warn(&format!("could not set a write timeout: {e}"));
+            log::warn!("could not set a write timeout: {e}");
         }
         let peer = stream
             .peer_addr()
