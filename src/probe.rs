@@ -8,9 +8,11 @@
 //! so even then it costs no extra engine session and happens once per content
 //! id instead of once per listener.
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::thread;
+
+use bytes::Bytes;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Probe {
@@ -59,7 +61,7 @@ pub fn parse(json: &str) -> Result<Probe, String> {
 }
 
 /// Run ffprobe over `preroll`, which must be raw MPEG-TS from the engine.
-pub fn run(preroll: &[u8]) -> Result<Probe, String> {
+pub fn run(preroll: Vec<Bytes>) -> Result<Probe, String> {
     let mut child = Command::new("ffprobe")
         .args([
             "-v",
@@ -87,12 +89,14 @@ pub fn run(preroll: &[u8]) -> Result<Probe, String> {
     // Feed stdin from its own thread: the preroll is larger than a pipe buffer,
     // so writing inline would deadlock against ffprobe filling stdout.
     let mut stdin = child.stdin.take().expect("stdin was piped");
-    let data = preroll.to_vec();
     let writer = thread::spawn(move || {
         // A broken pipe here is normal — ffprobe stops reading once it has seen
         // enough, and dropping stdin is what signals EOF.
-        let _ = stdin.write_all(&data);
-        let _: io::Result<()> = stdin.flush();
+        for chunk in &preroll {
+            if stdin.write_all(chunk).is_err() {
+                break;
+            }
+        }
     });
 
     let out = child

@@ -97,8 +97,9 @@ pub struct Plan {
 /// and late joiners can be aligned to one (see `mp4::Piece::keyframe`).
 pub type FragDurationMs = Option<u32>;
 
-fn s(v: &str) -> String {
-    v.to_owned()
+/// Append literal arguments to an argv.
+fn push(args: &mut Vec<String>, xs: &[&str]) {
+    args.extend(xs.iter().map(|x| x.to_string()));
 }
 
 /// How much input ffmpeg may examine before it must have identified the
@@ -147,54 +148,44 @@ fn probe_window(fmt: OutputFormat, keyframe_start: bool) -> (&'static str, &'sta
 /// Also without `-fflags nobuffer`, despite its billing as a low-latency flag:
 /// it slows stream analysis and so delays first output. Output-side latency is
 /// handled by -flush_packets and -avioflags direct, which cost nothing.
-fn input_args(fmt: OutputFormat, keyframe_start: bool) -> Vec<String> {
+fn input_args(args: &mut Vec<String>, fmt: OutputFormat, keyframe_start: bool) {
     let (analyzeduration, probesize) = probe_window(fmt, keyframe_start);
-    [
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        // discardcorrupt matters for a P2P source, where corrupt and partial
-        // frames are routine rather than exceptional.
-        "-fflags",
-        "discardcorrupt",
-        "-analyzeduration",
-        analyzeduration,
-        "-probesize",
-        probesize,
-        // The input is always raw TS from the engine puller; naming the demuxer
-        // skips format detection entirely.
-        "-f",
-        "mpegts",
-        "-i",
-        "pipe:0",
-    ]
-    .iter()
-    .map(|v| s(v))
-    .collect()
+    push(
+        args,
+        &[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            // discardcorrupt matters for a P2P source, where corrupt and partial
+            // frames are routine rather than exceptional.
+            "-fflags",
+            "discardcorrupt",
+            "-analyzeduration",
+            analyzeduration,
+            "-probesize",
+            probesize,
+            // The input is always raw TS from the engine puller; naming the demuxer
+            // skips format detection entirely.
+            "-f",
+            "mpegts",
+            "-i",
+            "pipe:0",
+        ],
+    );
 }
 
 /// Output-side options common to every format. `-flush_packets 1` is the single
 /// biggest steady-state latency win: without it ffmpeg's output AVIO buffers
 /// ~32KB before writing to the pipe, which at 128 kbps is ~2 seconds.
-fn flush_args() -> Vec<String> {
-    ["-avioflags", "direct", "-flush_packets", "1"]
-        .iter()
-        .map(|v| s(v))
-        .collect()
-}
+const FLUSH_ARGS: &[&str] = &["-avioflags", "direct", "-flush_packets", "1"];
 
-fn aac_encode() -> Vec<String> {
-    ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
-        .iter()
-        .map(|v| s(v))
-        .collect()
-}
+const AAC_ENCODE: &[&str] = &["-c:a", "aac", "-b:a", "128k", "-ac", "2"];
 
 /// The copy-first decision for one (format, source audio codec) pair.
 ///
 /// `audio_codec` is the source's first audio stream codec name as reported by
 /// ffprobe (e.g. "aac", "ac3"); `None` means no audio stream was found.
-pub fn modes(fmt: OutputFormat, audio_codec: Option<&str>) -> (TrackMode, TrackMode) {
+fn modes(fmt: OutputFormat, audio_codec: Option<&str>) -> (TrackMode, TrackMode) {
     match fmt {
         OutputFormat::Adts | OutputFormat::Mp3 => {
             let want = if fmt == OutputFormat::Adts {
@@ -233,72 +224,70 @@ pub fn plan(
     frag_ms: FragDurationMs,
     keyframe_start: bool,
 ) -> Plan {
-    let mut args = input_args(fmt, keyframe_start);
+    let mut args = Vec::new();
+    input_args(&mut args, fmt, keyframe_start);
     let (video, audio) = modes(fmt, audio_codec);
 
     match fmt {
         OutputFormat::Adts | OutputFormat::Mp3 => {
-            args.extend(["-vn", "-sn", "-dn"].iter().map(|v| s(v)));
+            push(&mut args, &["-vn", "-sn", "-dn"]);
 
             if audio == TrackMode::Copy {
-                args.extend(["-c:a", "copy"].iter().map(|v| s(v)));
+                push(&mut args, &["-c:a", "copy"]);
             } else if fmt == OutputFormat::Adts {
-                args.extend(aac_encode());
+                push(&mut args, AAC_ENCODE);
             } else {
-                args.extend(
-                    ["-c:a", "libmp3lame", "-b:a", "128k", "-ac", "2"]
-                        .iter()
-                        .map(|v| s(v)),
+                push(
+                    &mut args,
+                    &["-c:a", "libmp3lame", "-b:a", "128k", "-ac", "2"],
                 );
             }
 
-            args.extend(flush_args());
-            args.extend(["-f", fmt.as_str(), "pipe:1"].iter().map(|v| s(v)));
+            push(&mut args, FLUSH_ARGS);
+            push(&mut args, &["-f", fmt.as_str(), "pipe:1"]);
         }
 
         OutputFormat::Fmp4 => {
             // Video is always copied: that is where the CPU win is, and it is
             // what "zero copy" means here (no re-encode, not untouched bytes).
-            args.extend(["-c:v", "copy"].iter().map(|v| s(v)));
+            push(&mut args, &["-c:v", "copy"]);
 
             match audio {
                 TrackMode::Copy => {
-                    args.extend(["-c:a", "copy"].iter().map(|v| s(v)));
+                    push(&mut args, &["-c:a", "copy"]);
                     // MPEG-TS carries AAC in ADTS framing; MP4 wants raw AAC with
                     // an AudioSpecificConfig in the sample entry. The muxer does
                     // not convert on copy — without this it aborts the stream with
                     // "Malformed AAC bitstream detected". Not needed on the /audio
                     // routes, where ADTS is the native output framing, nor when
                     // transcoding, since the encoder emits raw AAC.
-                    args.extend(["-bsf:a", "aac_adtstoasc"].iter().map(|v| s(v)));
+                    push(&mut args, &["-bsf:a", "aac_adtstoasc"]);
                 }
-                TrackMode::Transcode => args.extend(aac_encode()),
-                TrackMode::Dropped => args.push(s("-an")),
+                TrackMode::Transcode => push(&mut args, AAC_ENCODE),
+                TrackMode::Dropped => push(&mut args, &["-an"]),
             }
 
             // Broadcast TS carries timestamp discontinuities that MP4 rejects.
-            args.extend(["-avoid_negative_ts", "make_zero"].iter().map(|v| s(v)));
-            args.extend(flush_args());
+            push(&mut args, &["-avoid_negative_ts", "make_zero"]);
+            push(&mut args, FLUSH_ARGS);
 
             if let Some(ms) = frag_ms {
                 // frag_duration is in microseconds. The muxer ORs it with
                 // frag_keyframe below, so a keyframe still always opens a fragment.
-                args.extend(
-                    ["-frag_duration", &(u64::from(ms) * 1000).to_string()]
-                        .iter()
-                        .map(|v| s(v)),
+                push(
+                    &mut args,
+                    &["-frag_duration", &(u64::from(ms) * 1000).to_string()],
                 );
             }
-            args.extend(
-                [
+            push(
+                &mut args,
+                &[
                     "-movflags",
                     "+frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset",
                     "-f",
                     "mp4",
                     "pipe:1",
-                ]
-                .iter()
-                .map(|v| s(v)),
+                ],
             );
         }
     }

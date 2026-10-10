@@ -15,6 +15,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::log;
+
 /// Matches the `-rw_timeout 30000000` the Go service passed to ffmpeg.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Short timeout for the small JSON control requests.
@@ -418,33 +420,6 @@ pub fn send_stop(command_url: &str) {
     let url = format!("{command_url}{sep}method=stop");
     if let Err(e) = get_text(&url, CONTROL_TIMEOUT) {
         log::warn(&format!("engine stop command failed: {e}"));
-    }
-}
-
-/// Tiny stderr logger matching the Go service's line format.
-pub mod log {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn stamp() -> String {
-        // Container runtimes add their own timestamps; this is a coarse
-        // seconds-since-epoch marker so lines remain orderable on their own.
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        format!("{secs}")
-    }
-
-    pub fn info(msg: &str) {
-        eprintln!("{} {}", stamp(), msg);
-    }
-
-    pub fn warn(msg: &str) {
-        eprintln!("{} warn: {}", stamp(), msg);
-    }
-
-    pub fn error(msg: &str) {
-        eprintln!("{} error: {}", stamp(), msg);
     }
 }
 

@@ -31,7 +31,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::engine::log;
+use crate::log;
 
 /// The whole head — request line, every header, and the blank line — must fit.
 /// tiny_http had no equivalent cap, which is the root of its open "capacity
@@ -329,6 +329,11 @@ impl Request {
     /// The request target, path and query together.
     pub fn url(&self) -> &str {
         &self.target
+    }
+
+    /// The request target up to any query.
+    pub fn path(&self) -> &str {
+        self.target.split('?').next().unwrap_or("/")
     }
 
     pub fn peer(&self) -> &str {

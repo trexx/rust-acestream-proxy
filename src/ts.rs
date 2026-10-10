@@ -173,18 +173,57 @@ impl Scanner {
     /// Input need not be packet-aligned: the scanner resynchronises on a sync
     /// byte that is followed by another one packet later, as the mpegts demuxer
     /// does, and carries a trailing partial packet into the next call.
+    ///
+    /// `data` is scanned in place. Only the carried bytes, and as much of
+    /// `data` as it takes to get past them, are joined into a scratch buffer:
+    /// at most two packets, where joining the whole chunk would copy every
+    /// byte from the engine a second time.
     pub fn feed(&mut self, data: &[u8]) -> Vec<Keyframe> {
-        let owned;
-        let buf: &[u8] = if self.carry.is_empty() {
-            data
-        } else {
-            owned = [self.carry.as_slice(), data].concat();
-            &owned
-        };
-        let base = self.pos;
         let mut found = Vec::new();
-        let mut i = 0;
-        while i + PACKET <= buf.len() {
+        let mut base = self.pos;
+        let mut from = 0;
+        if !self.carry.is_empty() {
+            let carried = self.carry.len();
+            let mut joint = std::mem::take(&mut self.carry);
+            joint.extend_from_slice(&data[..data.len().min(PACKET)]);
+            let i = self.scan(&joint, 0, carried, base, &mut found);
+            if i < carried {
+                // Too little arrived to get past the carry, so `joint` holds
+                // all of `data`: keep what is left of it for next time.
+                joint.drain(..i);
+                self.carry = joint;
+                self.pos = base + i as u64;
+                return found;
+            }
+            from = i - carried;
+            base += carried as u64;
+            joint.clear();
+            self.carry = joint; // keep the allocation
+        }
+        let i = self.scan(data, from, usize::MAX, base, &mut found);
+        self.carry.extend_from_slice(&data[i..]);
+        self.pos = base + i as u64;
+        found
+    }
+
+    /// Walk packets in `buf` from `i`, up to the first position at or past
+    /// `stop` or where a whole packet no longer fits, returning that position.
+    /// `base` is the absolute offset of `buf[0]`.
+    ///
+    /// A carried tail is scanned with only a packet of the next chunk joined
+    /// on, which is exactly enough: every position it starts a packet at is
+    /// below `stop`, and so lies under one packet from the end of the join,
+    /// leaving the next packet's sync byte in view as it would be in the whole
+    /// stream.
+    fn scan(
+        &mut self,
+        buf: &[u8],
+        mut i: usize,
+        stop: usize,
+        base: u64,
+        found: &mut Vec<Keyframe>,
+    ) -> usize {
+        while i < stop && i + PACKET <= buf.len() {
             let next = i + PACKET;
             if buf[i] != SYNC || (next < buf.len() && buf[next] != SYNC) {
                 i += 1; // resync a byte at a time
@@ -198,9 +237,7 @@ impl Scanner {
             }
             i = next;
         }
-        self.carry = buf[i..].to_vec();
-        self.pos = base + i as u64;
-        found
+        i
     }
 
     /// Handle one 188-byte packet. `Some(pts)` if it starts a video keyframe,
@@ -753,6 +790,42 @@ mod tests {
     }
 
     #[test]
+    fn chunking_never_changes_what_is_found() {
+        // A torn first packet, as an engine pull starts with, then real ones,
+        // so the scan resyncs and carries partial packets across every kind
+        // of chunk edge. (A stray sync byte exactly one packet before a chunk
+        // edge is taken on trust, there being nothing after it to confirm it
+        // by, so junk is left out: this checks the carry, not that heuristic.)
+        let (_, tables) = h264_stream();
+        let key = |n: u64| {
+            pes_at(
+                0x101,
+                n * 90_000,
+                None,
+                &[AUD.as_slice(), SPS.as_slice(), IDR.as_slice()].concat(),
+            )
+        };
+        let mut data = key(0)[50..].to_vec();
+        data.extend(&tables);
+        for n in 1..=6 {
+            data.extend(key(n));
+            data.extend(pes(
+                0x101,
+                None,
+                &[AUD.as_slice(), SLICE.as_slice()].concat(),
+            ));
+            data.extend(packet(0x101, false, None, &[0xAA; 100]));
+        }
+        let whole = Scanner::new().feed(&data);
+        assert_eq!(whole.len(), 6);
+        for chunk in [1, 2, 4, 187, 188, 189, 375, 376, 377, 1000] {
+            let mut s = Scanner::new();
+            let found: Vec<Keyframe> = data.chunks(chunk).flat_map(|c| s.feed(c)).collect();
+            assert_eq!(found, whole, "chunk size {chunk}");
+        }
+    }
+
+    #[test]
     fn resynchronises_after_junk_and_a_partial_packet() {
         let (_, tables) = h264_stream();
         let key = pes(
@@ -1027,7 +1100,7 @@ mod tests {
                 Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
                 _ => continue, // no ffmpeg, or not this encoder
             };
-            let Ok(probe) = crate::probe::run(&out) else {
+            let Ok(probe) = crate::probe::run(vec![bytes::Bytes::from(out.clone())]) else {
                 continue;
             };
             let mut s = Scanner::new();
