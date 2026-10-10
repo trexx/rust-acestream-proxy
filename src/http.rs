@@ -31,7 +31,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::engine::log;
+use crate::log;
 
 /// The whole head — request line, every header, and the blank line — must fit.
 /// tiny_http had no equivalent cap, which is the root of its open "capacity
@@ -283,13 +283,13 @@ impl Request {
         // relied on Linux copying the flag from listener to accepted socket.
         // Doing it here is explicit and drops the last use of the libc crate.
         if stream.set_nodelay(true).is_err() {
-            log::warn("could not set TCP_NODELAY; expect added latency");
+            log::warn!("could not set TCP_NODELAY; expect added latency");
         }
         if let Err(e) = stream.set_read_timeout(Some(HEAD_TIMEOUT)) {
-            log::warn(&format!("could not set a read timeout: {e}"));
+            log::warn!("could not set a read timeout: {e}");
         }
         if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
-            log::warn(&format!("could not set a write timeout: {e}"));
+            log::warn!("could not set a write timeout: {e}");
         }
         let peer = stream
             .peer_addr()
@@ -329,6 +329,11 @@ impl Request {
     /// The request target, path and query together.
     pub fn url(&self) -> &str {
         &self.target
+    }
+
+    /// The request target up to any query.
+    pub fn path(&self) -> &str {
+        self.target.split('?').next().unwrap_or("/")
     }
 
     pub fn peer(&self) -> &str {

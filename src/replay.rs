@@ -52,12 +52,21 @@ pub enum Policy {
 }
 
 /// What a new encoder is fed before live data.
+///
+/// The window's own chunks, refcounted rather than copied: a snapshot is taken
+/// under the locks the puller needs, so it must cost no more than the clones.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Primed {
-    pub data: Vec<u8>,
+    pub data: Vec<Bytes>,
     /// True when `data` begins on a video keyframe, so ffmpeg's stream
     /// analysis can be short.
     pub from_keyframe: bool,
+}
+
+impl Primed {
+    pub fn byte_count(&self) -> usize {
+        self.data.iter().map(Bytes::len).sum()
+    }
 }
 
 struct Chunk {
@@ -106,13 +115,14 @@ impl Replay {
         if self.scanner.latest_video_pts() != before {
             self.latest_pts_at = Some(at);
         }
-        self.bytes += data.len();
+        let len = data.len();
         self.chunks.push_back(Chunk {
             at,
             start: self.head,
             data,
         });
-        self.head += self.chunks.back().map_or(0, |c| c.data.len() as u64);
+        self.bytes += len;
+        self.head += len as u64;
         self.trim(at);
     }
 
@@ -197,18 +207,13 @@ impl Replay {
         }
     }
 
-    /// Everything from absolute offset `off` to the head, as one buffer.
-    fn bytes_from(&self, off: u64) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.head.saturating_sub(off) as usize);
-        for c in &self.chunks {
-            let end = c.start + c.data.len() as u64;
-            if end <= off {
-                continue;
-            }
-            let skip = off.saturating_sub(c.start) as usize;
-            out.extend_from_slice(&c.data[skip..]);
-        }
-        out
+    /// Everything from absolute offset `off` to the head.
+    fn bytes_from(&self, off: u64) -> Vec<Bytes> {
+        self.chunks
+            .iter()
+            .filter(|c| c.start + c.data.len() as u64 > off)
+            .map(|c| c.data.slice(off.saturating_sub(c.start) as usize..))
+            .collect()
     }
 }
 
@@ -217,13 +222,29 @@ impl Replay {
 /// parameters" failure mode off the table for the sake of a few bytes.
 ///
 /// A sync byte is only convincing if the next packet has one too.
-fn sync_trim(mut bytes: Vec<u8>) -> Vec<u8> {
-    let start = (0..bytes.len().min(TS_PACKET))
-        .find(|&i| bytes[i] == 0x47 && bytes.get(i + TS_PACKET).is_none_or(|&b| b == 0x47));
-    if let Some(i) = start {
-        bytes.drain(..i);
+fn sync_trim(mut chunks: Vec<Bytes>) -> Vec<Bytes> {
+    // Two packets' worth is all the search can look at.
+    let head: Vec<u8> = chunks
+        .iter()
+        .flat_map(|c| c.iter().copied())
+        .take(2 * TS_PACKET)
+        .collect();
+    let start = (0..head.len().min(TS_PACKET))
+        .find(|&i| head[i] == 0x47 && head.get(i + TS_PACKET).is_none_or(|&b| b == 0x47));
+    let Some(mut skip) = start else {
+        return chunks;
+    };
+    let mut whole = 0;
+    for c in &mut chunks {
+        if skip < c.len() {
+            *c = c.slice(skip..);
+            break;
+        }
+        skip -= c.len();
+        whole += 1;
     }
-    bytes
+    chunks.drain(..whole);
+    chunks
 }
 
 #[cfg(test)]
@@ -275,7 +296,7 @@ mod tests {
     }
 
     fn whole(r: &Replay) -> Vec<u8> {
-        r.snapshot(Policy::Tail(LONG)).data
+        r.snapshot(Policy::Tail(LONG)).data.concat()
     }
 
     #[test]
@@ -290,6 +311,24 @@ mod tests {
         assert!(window.len() <= cap);
         assert!(window.len() > cap - 64 * 1024 - 188);
         assert_eq!(&window[window.len() - 184..], &data[data.len() - 184..]);
+    }
+
+    #[test]
+    fn sync_trim_finds_the_boundary_across_chunk_edges() {
+        let data = ts_packets(4);
+        // Torn 57 bytes into a packet, with the next sync byte in the second
+        // chunk and the one confirming it in the third.
+        let torn = &data[57..];
+        for split in [1, 100, 131, 132, 200, 319, 320] {
+            let (a, rest) = torn.split_at(split.min(torn.len()));
+            let (b, c) = rest.split_at(188.min(rest.len()));
+            let chunks: Vec<Bytes> = [a, b, c]
+                .iter()
+                .map(|s| Bytes::copy_from_slice(s))
+                .collect();
+            let trimmed = sync_trim(chunks).concat();
+            assert_eq!(trimmed, &data[188..], "split at {split}");
+        }
     }
 
     #[test]
@@ -337,7 +376,7 @@ mod tests {
         let p = r.snapshot(Policy::FromKeyframe);
         assert!(p.from_keyframe);
         assert_eq!(
-            p.data,
+            p.data.concat(),
             [second, tail].concat(),
             "newest keyframe to the head"
         );
@@ -351,7 +390,7 @@ mod tests {
         r.push(Bytes::copy_from_slice(&data[1000..]));
         let p = r.snapshot(Policy::FromKeyframe);
         assert!(!p.from_keyframe);
-        assert_eq!(p.data, data);
+        assert_eq!(p.data.concat(), data);
     }
 
     #[test]
@@ -385,10 +424,12 @@ mod tests {
         let fresh = ts_packets(2);
         r.push(Bytes::from(fresh.clone()));
         assert_eq!(
-            r.snapshot(Policy::Tail(Duration::from_millis(10))).data,
+            r.snapshot(Policy::Tail(Duration::from_millis(10)))
+                .data
+                .concat(),
             fresh
         );
-        assert_eq!(r.snapshot(Policy::Tail(LONG)).data.len(), 6 * 188);
+        assert_eq!(r.snapshot(Policy::Tail(LONG)).byte_count(), 6 * 188);
     }
 
     #[test]
@@ -447,8 +488,10 @@ mod tests {
         // Non-video packets do not reset the clock.
         r.push(Bytes::from(ts_packets(2)));
         assert!(r.live_edge_age().unwrap() >= Duration::from_millis(60));
-        // A fresh video PTS does.
+        // A fresh video PTS does. Compared against the clock it replaced
+        // rather than a fixed bound, so a stalled runner cannot fail it.
+        let before = r.live_edge_age().unwrap();
         r.push(Bytes::from(slice_at(1.5)));
-        assert!(r.live_edge_age().unwrap() < Duration::from_millis(30));
+        assert!(r.live_edge_age().unwrap() < before);
     }
 }

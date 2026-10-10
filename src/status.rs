@@ -44,10 +44,10 @@ pub fn snapshot(reg: &Registry, started: Instant) -> Value {
                         "lingering": e.lingering(),
                         "listeners": listeners
                             .iter()
-                            .map(|(peer, uptime_s, bytes)| json!({
-                                "peer": peer,
-                                "uptime_s": uptime_s,
-                                "bytes_sent": bytes,
+                            .map(|l| json!({
+                                "peer": l.peer,
+                                "uptime_s": l.uptime_s,
+                                "bytes_sent": l.bytes_sent,
                             }))
                             .collect::<Vec<_>>(),
                     })

@@ -20,10 +20,22 @@
 //! Not immediately, though. A reconnect is the common case for a live viewer —
 //! a phone changing networks, a player restarting, a listener evicted for
 //! falling behind — and a cold start costs the engine's swarm discovery, which
-//! is 10–25s. So the last leaver's `Arc` is held for a **linger** period on a
-//! detached thread (see [`linger_encoder`] and [`linger_engine`]): the encoder
-//! keeps running with no listeners, and the engine pull keeps pulling with no
+//! is 10–25s. So the last leaver's `Arc` is parked in [`crate::linger`] for a
+//! period (see [`linger_encoder`] and [`linger_engine`]): the encoder keeps
+//! running with no listeners, and the engine pull keeps pulling with no
 //! encoders, until either a new listener claims them or the period lapses.
+//!
+//! # When the engine stops
+//!
+//! Refcounts cannot end a stream from the top. Listeners hold the encoder, the
+//! encoder holds the engine stream, and the engine stream holds the channels
+//! every one of them is blocked on, so a pull the engine has closed would
+//! otherwise stay open forever, and new listeners would join it. So the end is
+//! pushed down explicitly: [`EngineStream::end`] drops every feed, each ffmpeg
+//! sees EOF on stdin, flushes what it has and exits, and its drainer then
+//! [`Encoder::finish`]es, dropping every listener's channel so each request
+//! thread sees the end of its response. The registry treats an ended pull as
+//! absent, so the next request starts a fresh one.
 //!
 //! # Locking rule
 //!
@@ -38,9 +50,10 @@
 //! the only one in play and no cycle exists.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
@@ -49,11 +62,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
-use crate::engine::{self, log, Session};
+use crate::engine::{self, Session};
 use crate::format::{self, OutputFormat};
-use crate::mp4;
 use crate::probe::Probe;
 use crate::replay::{Policy, Replay};
+use crate::{linger, log, mp4};
 
 /// Read size for the engine pull and for ffmpeg output. A pipe read returns as
 /// soon as any data is there, so this is an upper bound, not a batching delay.
@@ -139,15 +152,60 @@ pub struct Config {
 // Tier 1: one engine pull per content id
 // ---------------------------------------------------------------------------
 
+/// Why the puller gave up on an encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wedged {
+    /// ffmpeg exited and its feeder went with it.
+    Gone,
+    /// ffmpeg took no input at all for [`TS_STALL`].
+    Stalled,
+}
+
+impl fmt::Display for Wedged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Wedged::Gone => "exited",
+            Wedged::Stalled => "stopped consuming input",
+        })
+    }
+}
+
+/// How far a feeder has got, shared with the puller so that it can sleep on a
+/// full queue until the feeder moves, rather than polling.
+#[derive(Default)]
+struct Progress {
+    state: Mutex<Fed>,
+    moved: Condvar,
+}
+
+#[derive(Default)]
+struct Fed {
+    /// Bytes written into ffmpeg so far: the puller's evidence that a full
+    /// queue is draining.
+    bytes: u64,
+    /// The feeder has exited; nothing more will be taken from the queue.
+    closed: bool,
+}
+
+impl Progress {
+    fn advance(&self, n: usize) {
+        lock(&self.state).bytes += n as u64;
+        self.moved.notify_all();
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.moved.notify_all();
+    }
+}
+
 /// The puller's handle on one encoder.
 struct Feed {
     encoder: Weak<Encoder>,
     /// Sender side lives here alone: dropping the entry closes the channel,
-    /// which is how a wedged encoder gets torn down.
+    /// which is how an encoder's input is ended.
     tx: SyncSender<Bytes>,
-    /// Bytes the feeder has written into ffmpeg so far; the puller's evidence
-    /// that a full queue is draining.
-    fed: Arc<AtomicU64>,
+    progress: Arc<Progress>,
 }
 
 pub struct EngineStream {
@@ -160,7 +218,7 @@ pub struct EngineStream {
     /// puller blocked in a 30s read instead of leaving the engine connection
     /// open until it times out.
     socket: OnceLock<TcpStream>,
-    stats: Mutex<Option<(Instant, serde_json::Value)>>,
+    stats: Mutex<Option<serde_json::Value>>,
     /// Trailing raw TS, from which each new encoder is primed.
     replay: Mutex<Replay>,
     encoders: Mutex<HashMap<OutputFormat, Feed>>,
@@ -169,20 +227,46 @@ pub struct EngineStream {
     /// the puller is never blocked behind a process spawn.
     creating: Mutex<()>,
     start: (Mutex<Start>, Condvar),
+    /// Set once the puller has stopped. Written under `encoders`, so no
+    /// encoder can register after [`EngineStream::end`] has cleared them.
+    ended: AtomicBool,
     config: Arc<Config>,
 }
 
 impl EngineStream {
+    fn new(content_id: &str, config: Arc<Config>) -> Self {
+        EngineStream {
+            content_id: content_id.to_owned(),
+            started: Instant::now(),
+            bytes_in: AtomicU64::new(0),
+            session: OnceLock::new(),
+            probe: OnceLock::new(),
+            socket: OnceLock::new(),
+            stats: Mutex::new(None),
+            replay: Mutex::new(Replay::new(REPLAY_MAX_AGE, REPLAY_MAX_BYTES)),
+            encoders: Mutex::new(HashMap::new()),
+            creating: Mutex::new(()),
+            start: (Mutex::new(Start::Pending), Condvar::new()),
+            ended: AtomicBool::new(false),
+            config,
+        }
+    }
+
     pub fn probe(&self) -> Option<&Probe> {
         self.probe.get()
     }
 
     pub fn stats(&self) -> Option<serde_json::Value> {
-        lock(&self.stats).as_ref().map(|(_, v)| v.clone())
+        lock(&self.stats).clone()
     }
 
     fn stat_url(&self) -> Option<String> {
         self.session.get().and_then(|s| s.stat_url.clone())
+    }
+
+    /// True once the engine pull has stopped for good.
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
     }
 
     /// Upgrade every live encoder, releasing the lock before the returned
@@ -225,14 +309,62 @@ impl EngineStream {
         }
     }
 
+    /// Settle startup. Only the first outcome counts: a pull that fails after
+    /// it was ready has ended, which is [`EngineStream::end`]'s business.
     fn publish(&self, outcome: Result<(), String>) {
         let (lk, cv) = &self.start;
         let mut state = lock(lk);
-        *state = match outcome {
-            Ok(()) => Start::Ready,
-            Err(e) => Start::Failed(e),
+        if matches!(*state, Start::Pending) {
+            *state = match outcome {
+                Ok(()) => Start::Ready,
+                Err(e) => Start::Failed(e),
+            };
+            cv.notify_all();
+        }
+    }
+
+    /// The pull is over: drop every feed, so each ffmpeg sees EOF on stdin,
+    /// flushes what it has, and exits — and its drainer then ends its
+    /// listeners' responses. See "When the engine stops" in the module docs.
+    fn end(&self) {
+        let feeds = {
+            let mut map = lock(&self.encoders);
+            self.ended.store(true, Ordering::Relaxed);
+            std::mem::take(&mut *map)
         };
-        cv.notify_all();
+        // Weak handles and senders only, so dropping them under the lock would
+        // be safe too; there is just no reason to hold it.
+        drop(feeds);
+    }
+
+    /// Stop feeding the encoders the puller has given up on, unless a
+    /// replacement has taken the slot meanwhile (`progress` tells them apart).
+    ///
+    /// A stalled ffmpeg is killed as well: it has stopped reading, so closing
+    /// its stdin may never end it, and until it ends its listeners wait on it.
+    fn drop_wedged(&self, wedged: Vec<(OutputFormat, Arc<Progress>, Wedged)>) {
+        let removed: Vec<(OutputFormat, Feed, Wedged)> = {
+            let mut map = lock(&self.encoders);
+            let mut removed = Vec::new();
+            for (fmt, progress, why) in wedged {
+                if map
+                    .get(&fmt)
+                    .is_some_and(|f| Arc::ptr_eq(&f.progress, &progress))
+                {
+                    removed.extend(map.remove(&fmt).map(|f| (fmt, f, why)));
+                }
+            }
+            removed
+        };
+        for (fmt, feed, why) in removed {
+            if why == Wedged::Stalled {
+                log::error!("{}/{fmt}: encoder {why}; torn down", self.content_id);
+                // Upgraded only now, outside the lock: see the locking rule.
+                if let Some(enc) = feed.encoder.upgrade() {
+                    enc.kill();
+                }
+            }
+        }
     }
 }
 
@@ -244,7 +376,7 @@ impl Drop for EngineStream {
         if let Some(s) = self.socket.get() {
             let _ = s.shutdown(Shutdown::Both);
         }
-        log::info(&format!("{}: engine stream closed", self.content_id));
+        log::info!("{}: engine stream closed", self.content_id);
     }
 }
 
@@ -253,103 +385,69 @@ impl Drop for EngineStream {
 /// filling the replay window meanwhile, so the rejoin also primes instantly.
 fn linger_engine(stream: Arc<EngineStream>) {
     let d = stream.config.engine_linger;
-    if d.is_zero() {
+    if d.is_zero() || stream.ended() {
         return;
     }
-    let name = format!("linger-{}", short(&stream.content_id));
-    log::info(&format!(
+    log::info!(
         "{}: no encoders; keeping the engine pull for {}s",
         stream.content_id,
         d.as_secs()
-    ));
-    // If the thread cannot be spawned the closure drops with the Arc, which
-    // is simply the un-lingered teardown.
-    let _ = thread::Builder::new().name(name).spawn(move || {
-        thread::sleep(d);
-        drop(stream);
-    });
+    );
+    linger::hold(stream, d);
 }
 
 /// The puller: one thread per content id, holding the sole engine connection.
 fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
-    let pid = now_pid();
-    let session = match engine::open_session(&config.engine_host, &content_id, &pid) {
-        Ok(s) => s,
-        Err(e) => {
-            if let Some(s) = stream.upgrade() {
-                s.publish(Err(e));
+    let outcome = match engine::open_session(&config.engine_host, &content_id, &now_pid()) {
+        Ok(session) => {
+            let command_url = session.command_url.clone();
+            let outcome = relay(&stream, &content_id, session);
+            if let Some(url) = &command_url {
+                engine::send_stop(url);
             }
-            return;
+            outcome
         }
+        Err(e) => Err(e),
     };
-    // Kept on the thread so teardown can stop the engine session even as the
-    // EngineStream is being dropped out from under us.
-    let command_url = session.command_url.clone();
-    let stop_engine = || {
-        if let Some(url) = &command_url {
-            engine::send_stop(url);
-        }
-    };
+    if let Some(s) = stream.upgrade() {
+        // Reaches anyone still waiting on a startup that failed; a no-op once
+        // the stream was ready.
+        s.publish(outcome);
+        s.end();
+    }
+}
 
+/// Open the engine stream, identify it, then hand every chunk to the replay
+/// window and the encoders until the engine stops or the stream is dropped.
+fn relay(stream: &Weak<EngineStream>, content_id: &str, session: Session) -> Result<(), String> {
+    let gone = || "stream torn down during startup".to_string();
     let mut resp = match engine::get(&session.playback_url, engine::STALL_TIMEOUT) {
         Ok(r) if r.status == 200 => r,
-        Ok(r) => {
-            if let Some(s) = stream.upgrade() {
-                s.publish(Err(format!("engine returned http {}", r.status)));
-            }
-            stop_engine();
-            return;
-        }
-        Err(e) => {
-            if let Some(s) = stream.upgrade() {
-                s.publish(Err(format!("could not open engine stream: {e}")));
-            }
-            stop_engine();
-            return;
-        }
+        Ok(r) => return Err(format!("engine returned http {}", r.status)),
+        Err(e) => return Err(format!("could not open engine stream: {e}")),
     };
 
     // Register the socket before the first blocking read, so a teardown during
     // startup interrupts the puller rather than waiting out the stall timeout.
-    match stream.upgrade() {
-        Some(s) => {
-            if let Ok(sock) = resp.socket.try_clone() {
-                let _ = s.socket.set(sock);
-            }
-        }
-        None => {
-            stop_engine();
-            return;
+    {
+        let s = stream.upgrade().ok_or_else(gone)?;
+        if let Ok(sock) = resp.socket.try_clone() {
+            let _ = s.socket.set(sock);
         }
     }
 
     // Identify the source from its PMT as the first packets arrive. Every
     // format and every later listener reuses the answer. ffprobe over a
     // preroll is only the fallback, for a stream the scanner cannot name.
-    let mut buf = vec![0u8; CHUNK];
-    let (probed, how) = match identify(&mut resp.body, &stream, &mut buf) {
-        Ok(found) => found,
-        Err(e) => {
-            if let Some(s) = stream.upgrade() {
-                s.publish(Err(e));
-            }
-            stop_engine();
-            return;
-        }
-    };
-
+    let (probed, how) = identify(&mut resp.body, stream)?;
     {
-        let Some(s) = stream.upgrade() else {
-            stop_engine();
-            return;
-        };
+        let s = stream.upgrade().ok_or_else(gone)?;
         let _ = s.session.set(session);
-        log::info(&format!(
-            "{}: engine stream up, video={} audio={} ({how})",
-            content_id,
+        log::info!(
+            "{content_id}: engine stream up, video={} audio={} ({how})",
             probed.video.as_deref().unwrap_or("none"),
             probed.audio.as_deref().unwrap_or("none"),
-        ));
+        );
         let _ = s.probe.set(probed);
         s.publish(Ok(()));
     }
@@ -358,7 +456,7 @@ fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
     loop {
         let n = match resp.body.read(&mut buf) {
             Ok(0) => {
-                log::info(&format!("{content_id}: engine closed the stream"));
+                log::info!("{content_id}: engine closed the stream");
                 break;
             }
             Ok(n) => n,
@@ -369,7 +467,7 @@ fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
                 // puller stops promptly — and that is not a failure worth
                 // reporting. If the stream is already gone, this is that.
                 if stream.upgrade().is_some() {
-                    log::warn(&format!("{content_id}: engine read failed: {e}"));
+                    log::warn!("{content_id}: engine read failed: {e}");
                 }
                 break;
             }
@@ -386,31 +484,24 @@ fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
         // Snapshot the senders so the lock is not held across a blocking send.
         // Never upgrade the Weak<Encoder> here either: dropping the last Arc
         // under this lock would re-enter Encoder::drop and deadlock.
-        let targets: Vec<(OutputFormat, SyncSender<Bytes>, Arc<AtomicU64>)> = {
+        let targets: Vec<(OutputFormat, SyncSender<Bytes>, Arc<Progress>)> = {
             let map = lock(&s.encoders);
             map.iter()
-                .map(|(f, feed)| (*f, feed.tx.clone(), feed.fed.clone()))
+                .map(|(f, feed)| (*f, feed.tx.clone(), feed.progress.clone()))
                 .collect()
         };
 
         let mut wedged = Vec::new();
-        for (fmt, tx, fed) in &targets {
-            if let Err(reason) = send_backpressured(tx, fed, chunk.clone()) {
-                wedged.push((*fmt, reason));
+        for (fmt, tx, progress) in targets {
+            if let Err(why) = send_backpressured(&tx, &progress, chunk.clone()) {
+                wedged.push((fmt, progress, why));
             }
         }
-
         if !wedged.is_empty() {
-            let mut map = lock(&s.encoders);
-            for (fmt, reason) in wedged {
-                if map.remove(&fmt).is_some() && reason != "gone" {
-                    log::error(&format!("{content_id}/{fmt}: encoder {reason}; torn down"));
-                }
-            }
+            s.drop_wedged(wedged);
         }
     }
-
-    stop_engine();
+    Ok(())
 }
 
 /// Read from the engine until the source is identified, feeding the replay
@@ -418,45 +509,39 @@ fn pull(stream: Weak<EngineStream>, content_id: String, config: Arc<Config>) {
 ///
 /// The PMT settles it within the first packets. If it has not by
 /// [`PREROLL`] bytes — a first audio stream the scanner cannot name — ffprobe
-/// gets what was read so far.
-fn identify(
-    body: &mut impl Read,
-    stream: &Weak<EngineStream>,
-    buf: &mut [u8],
-) -> Result<(Probe, String), String> {
-    let mut preroll: Vec<u8> = Vec::new();
-    loop {
-        let n = match body.read(buf) {
+/// gets what was read so far, straight from the replay window.
+fn identify(body: &mut impl Read, stream: &Weak<EngineStream>) -> Result<(Probe, String), String> {
+    let gone = || "stream torn down during startup".to_string();
+    let mut buf = vec![0u8; CHUNK];
+    let mut read = 0usize;
+    while read < PREROLL {
+        let n = match body.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => return Err(format!("engine stream failed during preroll: {e}")),
         };
-        let s = stream.upgrade().ok_or("stream torn down during startup")?;
+        read += n;
+        let s = stream.upgrade().ok_or_else(gone)?;
         s.bytes_in.fetch_add(n as u64, Ordering::Relaxed);
-        let chunk = Bytes::copy_from_slice(&buf[..n]);
-        if preroll.len() < PREROLL {
-            preroll.extend_from_slice(&chunk);
-        }
         let program = {
             let mut replay = lock(&s.replay);
-            replay.push(chunk);
+            replay.push(Bytes::copy_from_slice(&buf[..n]));
             replay.program()
         };
         if let Some(p) = program {
-            return Ok((
-                Probe::from(p),
-                format!("from the PMT, {} bytes in", preroll.len()),
-            ));
-        }
-        if preroll.len() >= PREROLL {
-            break;
+            return Ok((Probe::from(p), format!("from the PMT, {read} bytes in")));
         }
     }
-    if preroll.is_empty() {
+    if read == 0 {
         return Err("engine stream ended before sending anything".into());
     }
-    let probed = crate::probe::run(&preroll).map_err(|e| format!("could not probe stream: {e}"))?;
-    Ok((probed, format!("ffprobe over {} bytes", preroll.len())))
+    let preroll = {
+        let s = stream.upgrade().ok_or_else(gone)?;
+        let preroll = lock(&s.replay).snapshot(Policy::Tail(REPLAY_MAX_AGE));
+        preroll.data
+    };
+    let probed = crate::probe::run(preroll).map_err(|e| format!("could not probe stream: {e}"))?;
+    Ok((probed, format!("ffprobe over {read} bytes")))
 }
 
 /// Hand a chunk to one encoder, waiting for room rather than giving up.
@@ -468,28 +553,38 @@ fn identify(
 /// only gives up once the encoder has made no progress at all for [`TS_STALL`].
 fn send_backpressured(
     tx: &SyncSender<Bytes>,
-    fed: &AtomicU64,
+    progress: &Progress,
     chunk: Bytes,
-) -> Result<(), &'static str> {
-    let mut seen = fed.load(Ordering::Relaxed);
+) -> Result<(), Wedged> {
+    let mut seen = lock(&progress.state).bytes;
     let mut deadline = Instant::now() + TS_STALL;
     let mut chunk = chunk;
     loop {
-        match tx.try_send(chunk) {
+        chunk = match tx.try_send(chunk) {
             Ok(()) => return Ok(()),
-            // ffmpeg exited and its feeder went with it.
-            Err(TrySendError::Disconnected(_)) => return Err("gone"),
-            Err(TrySendError::Full(returned)) => {
-                let now = fed.load(Ordering::Relaxed);
-                if now != seen {
-                    seen = now;
-                    deadline = Instant::now() + TS_STALL;
-                } else if Instant::now() >= deadline {
-                    return Err("stopped consuming input");
-                }
-                chunk = returned;
-                thread::sleep(Duration::from_millis(5));
+            Err(TrySendError::Disconnected(_)) => return Err(Wedged::Gone),
+            Err(TrySendError::Full(returned)) => returned,
+        };
+        // The queue is full: sleep until the feeder writes something.
+        let mut fed = lock(&progress.state);
+        loop {
+            if fed.closed {
+                return Err(Wedged::Gone);
             }
+            if fed.bytes != seen {
+                seen = fed.bytes;
+                deadline = Instant::now() + TS_STALL;
+                break;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Wedged::Stalled);
+            }
+            fed = progress
+                .moved
+                .wait_timeout(fed, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 }
@@ -529,6 +624,30 @@ impl Listener {
     }
 }
 
+/// One listener, as /status reports it.
+pub struct ListenerInfo {
+    pub peer: String,
+    pub uptime_s: u64,
+    pub bytes_sent: u64,
+}
+
+/// Where an encoder's output stands, as far as a joiner is concerned. One
+/// value behind one lock, so a joiner reading it and the drainer changing it
+/// cannot interleave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Output {
+    /// Running. For fMP4, the init segment is not complete yet.
+    Starting,
+    /// fMP4 only: the init segment, replayed to every late joiner.
+    Ready(Bytes),
+    /// fMP4 only: the byte stream stopped parsing, so fragment boundaries are
+    /// no longer reliable. Late joiners are refused rather than served
+    /// something they cannot decode.
+    Unjoinable,
+    /// ffmpeg's output has ended, in any format.
+    Finished,
+}
+
 pub struct Encoder {
     pub content_id: String,
     pub fmt: OutputFormat,
@@ -541,16 +660,9 @@ pub struct Encoder {
     /// so it is roughly how far behind live its listeners sit. `None` when it
     /// could not be primed from a keyframe. Reported by /status.
     pub primed_behind_live: Option<Duration>,
-    /// Cached fMP4 init segment, replayed to every late joiner. Joiners block
-    /// on `init_ready` until the first `moof` has been written.
-    init: Mutex<Option<Bytes>>,
-    init_ready: Condvar,
-    /// Set if the fMP4 byte stream did not parse; late joiners are refused
-    /// rather than served something they cannot decode.
-    unjoinable: AtomicBool,
-    /// Set when ffmpeg's output ends, so joiners stop waiting on an init
-    /// segment that will never arrive.
-    finished: AtomicBool,
+    output: Mutex<Output>,
+    /// Signalled on every change to `output`; joiners wait on it.
+    output_changed: Condvar,
     listeners: Mutex<Vec<Listener>>,
     next_id: AtomicU64,
     child: Mutex<Option<Child>>,
@@ -558,20 +670,42 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    fn new(
+        engine: Arc<EngineStream>,
+        fmt: OutputFormat,
+        video: format::TrackMode,
+        audio: format::TrackMode,
+        primed_behind_live: Option<Duration>,
+    ) -> Self {
+        Encoder {
+            content_id: engine.content_id.clone(),
+            fmt,
+            started: Instant::now(),
+            bytes_out: AtomicU64::new(0),
+            video,
+            audio,
+            primed_behind_live,
+            output: Mutex::new(Output::Starting),
+            output_changed: Condvar::new(),
+            listeners: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
+            child: Mutex::new(None),
+            engine,
+        }
+    }
+
     #[cfg(test)]
     fn listener_count(&self) -> usize {
         lock(&self.listeners).len()
     }
 
-    pub fn listener_info(&self) -> Vec<(String, u64, u64)> {
+    pub fn listener_info(&self) -> Vec<ListenerInfo> {
         lock(&self.listeners)
             .iter()
-            .map(|l| {
-                (
-                    l.peer.clone(),
-                    l.joined.elapsed().as_secs(),
-                    l.bytes.load(Ordering::Relaxed),
-                )
+            .map(|l| ListenerInfo {
+                peer: l.peer.clone(),
+                uptime_s: l.joined.elapsed().as_secs(),
+                bytes_sent: l.bytes.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -579,6 +713,11 @@ impl Encoder {
     /// True while ffmpeg is being kept alive with no listener on it.
     pub fn lingering(&self) -> bool {
         lock(&self.listeners).is_empty()
+    }
+
+    /// True once ffmpeg's output has ended.
+    fn finished(&self) -> bool {
+        *lock(&self.output) == Output::Finished
     }
 
     /// Nanoseconds since the encoder started: the clock listener lag is kept in.
@@ -630,7 +769,6 @@ impl Encoder {
         });
         Ok(Subscription {
             rx,
-            leftover: Bytes::new(),
             bytes,
             queued,
             consumed_at,
@@ -639,11 +777,14 @@ impl Encoder {
         })
     }
 
-    /// Deregister a listener; true if it was the last one.
+    /// Deregister a listener; true if it was registered and was the last one.
+    /// An encoder that has finished has already let every listener go, and
+    /// their departures must not each look like the last.
     fn remove_listener(&self, id: u64) -> bool {
         let mut listeners = lock(&self.listeners);
+        let before = listeners.len();
         listeners.retain(|l| l.id != id);
-        listeners.is_empty()
+        listeners.len() < before && listeners.is_empty()
     }
 
     /// Block until the first `moof` has been written, so an fMP4 joiner gets a
@@ -653,20 +794,16 @@ impl Encoder {
     /// correct: tearing down and retrying would restart ffmpeg each time and
     /// never converge, since the fragment clock restarts with it.
     fn await_init_segment(&self) -> Result<Bytes, String> {
-        let mut init = lock(&self.init);
+        let mut output = lock(&self.output);
         let deadline = Instant::now() + INIT_TIMEOUT;
         loop {
-            // Checked before the cached segment: once the box structure has
-            // broken, fragment boundaries are no longer reliable, so a joiner
-            // would take the init segment and then never attach.
-            if self.unjoinable.load(Ordering::Relaxed) {
-                return Err("stream is not valid fragmented mp4".into());
-            }
-            if let Some(i) = init.as_ref() {
-                return Ok(i.clone());
-            }
-            if self.finished.load(Ordering::Relaxed) {
-                return Err("encoder stopped before producing a fragment".into());
+            match &*output {
+                Output::Ready(init) => return Ok(init.clone()),
+                Output::Unjoinable => return Err("stream is not valid fragmented mp4".into()),
+                Output::Finished => {
+                    return Err("encoder stopped before producing a fragment".into())
+                }
+                Output::Starting => {}
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -675,18 +812,33 @@ impl Encoder {
                     INIT_TIMEOUT.as_secs()
                 ));
             }
-            let (g, _) = self
-                .init_ready
-                .wait_timeout(init, left)
-                .unwrap_or_else(|e| e.into_inner());
-            init = g;
+            output = self
+                .output_changed
+                .wait_timeout(output, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
-    /// Wake anything waiting on the init segment after a terminal state change.
-    fn notify_joiners(&self) {
-        let _guard = lock(&self.init);
-        self.init_ready.notify_all();
+    fn set_output(&self, output: Output) {
+        *lock(&self.output) = output;
+        self.output_changed.notify_all();
+    }
+
+    /// ffmpeg's output has ended: release anyone waiting for a first fragment,
+    /// and end every listener's response. Dropping a listener's sender is what
+    /// makes its `Subscription::recv` return `None`; without this they would
+    /// wait forever on an encoder their own subscriptions keep alive.
+    fn finish(&self) {
+        self.set_output(Output::Finished);
+        lock(&self.listeners).clear();
+    }
+
+    /// Kill ffmpeg. Its output then ends, and the drainer finishes the encoder.
+    fn kill(&self) {
+        if let Some(c) = lock(&self.child).as_mut() {
+            let _ = c.kill();
+        }
     }
 
     /// Deliver one scanned piece to every listener.
@@ -723,14 +875,14 @@ impl Encoder {
                 now.saturating_sub(l.oldest_unread.max(l.consumed_at.load(Ordering::Relaxed))),
             );
             if behind > SUB_MAX_LAG || queued + data.len() > SUB_MAX_BYTES {
-                log::warn(&format!(
+                log::warn!(
                     "{}/{}: {} fell {:.1}s and {}KB behind; disconnecting",
                     self.content_id,
                     self.fmt,
                     l.peer,
                     behind.as_secs_f64(),
                     queued / 1024
-                ));
+                );
                 l.kick();
                 return false;
             }
@@ -770,16 +922,16 @@ impl Drop for Encoder {
         }
         let last = map.is_empty();
         drop(map);
-        log::info(&format!(
+        log::info!(
             "{}/{}: encoder stopped after {}s, {} bytes",
             self.content_id,
             self.fmt,
             self.started.elapsed().as_secs(),
             self.bytes_out.load(Ordering::Relaxed)
-        ));
+        );
         if last {
             // Our Arc<EngineStream> is about to drop with us; hand the pull to
-            // a linger thread instead of letting that close it.
+            // the linger instead of letting that close it.
             linger_engine(self.engine.clone());
         }
     }
@@ -787,17 +939,12 @@ impl Drop for Encoder {
 
 /// Keep an encoder alive for the configured linger after its last listener
 /// has left, so a reconnecting viewer joins a running ffmpeg — sub-second,
-/// versus a fresh start.
+/// versus a fresh start. A finished encoder is no use to anyone and goes now.
 fn linger_encoder(enc: Arc<Encoder>) {
     let d = enc.engine.config.encoder_linger;
-    if d.is_zero() {
-        return;
+    if !enc.finished() {
+        linger::hold(enc, d);
     }
-    let name = format!("linger-{}-{}", short(&enc.content_id), enc.fmt);
-    let _ = thread::Builder::new().name(name).spawn(move || {
-        thread::sleep(d);
-        drop(enc);
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -808,7 +955,6 @@ fn linger_encoder(enc: Arc<Encoder>) {
 /// if it was the last one, starts the encoder's linger.
 pub struct Subscription {
     rx: Receiver<(u64, Bytes)>,
-    leftover: Bytes,
     bytes: Arc<AtomicU64>,
     queued: Arc<AtomicUsize>,
     consumed_at: Arc<AtomicU64>,
@@ -816,35 +962,24 @@ pub struct Subscription {
     encoder: Arc<Encoder>,
 }
 
-impl Read for Subscription {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.leftover.is_empty() {
-            match self.rx.recv() {
-                Ok((at, b)) => {
-                    self.queued.fetch_sub(b.len(), Ordering::Relaxed);
-                    self.consumed_at.store(at, Ordering::Relaxed);
-                    self.leftover = b;
-                }
-                // Encoder gone or listener evicted: a clean end of response.
-                Err(_) => return Ok(0),
-            }
-        }
-        let n = buf.len().min(self.leftover.len());
-        buf[..n].copy_from_slice(&self.leftover[..n]);
-        self.leftover = self.leftover.slice(n..);
-        Ok(n)
-    }
-}
-
-impl Drop for Subscription {
-    fn drop(&mut self) {
-        if self.encoder.remove_listener(self.id) {
-            linger_encoder(self.encoder.clone());
-        }
-    }
-}
-
 impl Subscription {
+    /// The next chunk, blocking until there is one. `None` is the clean end of
+    /// the response: the encoder has finished, or this listener was evicted.
+    pub fn recv(&self) -> Option<Bytes> {
+        self.rx.recv().ok().map(|(at, b)| self.took(at, b))
+    }
+
+    /// The next chunk if one is already queued.
+    pub fn try_recv(&self) -> Option<Bytes> {
+        self.rx.try_recv().ok().map(|(at, b)| self.took(at, b))
+    }
+
+    fn took(&self, at: u64, chunk: Bytes) -> Bytes {
+        self.queued.fetch_sub(chunk.len(), Ordering::Relaxed);
+        self.consumed_at.store(at, Ordering::Relaxed);
+        chunk
+    }
+
     #[cfg(test)]
     fn bytes_sent(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
@@ -854,6 +989,14 @@ impl Subscription {
     /// into a response body, so the request thread can still log a total.
     pub fn counter(&self) -> Arc<AtomicU64> {
         self.bytes.clone()
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if self.encoder.remove_listener(self.id) {
+            linger_encoder(self.encoder.clone());
+        }
     }
 }
 
@@ -888,26 +1031,20 @@ impl Registry {
     fn engine_stream(&self, content_id: &str) -> Result<Arc<EngineStream>, String> {
         let (stream, fresh) = {
             let mut map = lock(&self.streams);
-            match map.get(content_id).and_then(|w| w.upgrade()) {
+            // An ended pull can outlive its end, held by encoders flushing
+            // their last output, but it will never carry anything again:
+            // start a fresh one rather than join it.
+            match map
+                .get(content_id)
+                .and_then(Weak::upgrade)
+                .filter(|s| !s.ended())
+            {
                 Some(s) => (s, false),
                 None => {
                     // Entries outlive their streams; sweep the dead ones now
                     // rather than growing by one per content id ever seen.
                     map.retain(|_, w| w.strong_count() > 0);
-                    let s = Arc::new(EngineStream {
-                        content_id: content_id.to_owned(),
-                        started: Instant::now(),
-                        bytes_in: AtomicU64::new(0),
-                        session: OnceLock::new(),
-                        probe: OnceLock::new(),
-                        socket: OnceLock::new(),
-                        stats: Mutex::new(None),
-                        replay: Mutex::new(Replay::new(REPLAY_MAX_AGE, REPLAY_MAX_BYTES)),
-                        encoders: Mutex::new(HashMap::new()),
-                        creating: Mutex::new(()),
-                        start: (Mutex::new(Start::Pending), Condvar::new()),
-                        config: self.config.clone(),
-                    });
+                    let s = Arc::new(EngineStream::new(content_id, self.config.clone()));
                     map.insert(content_id.to_owned(), Arc::downgrade(&s));
                     (s, true)
                 }
@@ -960,7 +1097,7 @@ fn get_or_start_encoder(
         // A finished encoder is still registered while its last listener drains;
         // start a replacement rather than joining a dead one.
         if let Some(e) = existing {
-            if !e.finished.load(Ordering::Relaxed) {
+            if !e.finished() {
                 return Ok(e);
             }
         }
@@ -972,66 +1109,59 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
     let probe = stream
         .probe()
         .ok_or_else(|| "engine stream has no probe result".to_string())?;
-    let (video, audio) = format::modes(fmt, probe.audio.as_deref());
-    // How far behind live this encoder starts, for /status. Only meaningful
-    // for video, which is primed from a keyframe; audio has no keyframe lag.
-    let primed_behind_live = if fmt.has_video() {
-        lock(&stream.replay).newest_keyframe_lag()
+    let policy = if fmt.has_video() {
+        Policy::FromKeyframe
     } else {
-        None
+        Policy::Tail(AUDIO_TAIL)
     };
-
-    let encoder = Arc::new(Encoder {
-        content_id: stream.content_id.clone(),
-        fmt,
-        started: Instant::now(),
-        bytes_out: AtomicU64::new(0),
-        video,
-        audio,
-        primed_behind_live,
-        init: Mutex::new(None),
-        init_ready: Condvar::new(),
-        unjoinable: AtomicBool::new(false),
-        finished: AtomicBool::new(false),
-        listeners: Mutex::new(Vec::new()),
-        next_id: AtomicU64::new(0),
-        child: Mutex::new(None),
-        engine: stream.clone(),
-    });
-
     let (tx, rx) = sync_channel::<Bytes>(TS_QUEUE);
-    let fed = Arc::new(AtomicU64::new(0));
+    let progress = Arc::new(Progress::default());
+
     // Snapshot the replay window and register in one step, holding the map lock
     // across both. The puller appends to `replay` before sending to registered
     // encoders, so taking these separately could duplicate a chunk (in the
     // window and again live) or drop one. Registered before ffmpeg is spawned,
     // since the analysis window depends on what the snapshot starts with; the
     // queue simply fills for the few milliseconds that takes.
-    let policy = if fmt.has_video() {
-        Policy::FromKeyframe
-    } else {
-        Policy::Tail(AUDIO_TAIL)
-    };
-    let primed = {
+    let (encoder, plan, primed) = {
         let mut map = lock(&stream.encoders);
-        let primed = lock(&stream.replay).snapshot(policy);
+        if stream.ended() {
+            // The puller has gone; nothing would ever feed this encoder.
+            return Err("engine stream has ended".into());
+        }
+        let replay = lock(&stream.replay);
+        let primed = replay.snapshot(policy);
+        // How far behind live this encoder starts, for /status. Only meaningful
+        // for video, which is primed from a keyframe; audio has no keyframe lag.
+        let behind = fmt
+            .has_video()
+            .then(|| replay.newest_keyframe_lag())
+            .flatten();
+        drop(replay);
+        let plan = format::plan(
+            fmt,
+            probe.audio.as_deref(),
+            stream.config.frag_duration_ms,
+            primed.from_keyframe,
+        );
+        let encoder = Arc::new(Encoder::new(
+            stream.clone(),
+            fmt,
+            plan.video,
+            plan.audio,
+            behind,
+        ));
         map.insert(
             fmt,
             Feed {
                 encoder: Arc::downgrade(&encoder),
                 tx,
-                fed: fed.clone(),
+                progress: progress.clone(),
             },
         );
-        primed
+        (encoder, plan, primed)
     };
 
-    let plan = format::plan(
-        fmt,
-        probe.audio.as_deref(),
-        stream.config.frag_duration_ms,
-        primed.from_keyframe,
-    );
     let mut child = match Command::new("ffmpeg")
         .args(&plan.args)
         .stdin(Stdio::piped())
@@ -1043,7 +1173,8 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
     {
         Ok(c) => c,
         Err(e) => {
-            // Undo the registration; the Arc<Encoder> drops with this frame.
+            // Undo the registration; the Arc<Encoder> drops with this frame,
+            // after the lock is released.
             lock(&stream.encoders).remove(&fmt);
             return Err(format!("could not start ffmpeg: {e}"));
         }
@@ -1057,11 +1188,11 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
     // writing output once its stdout pipe fills, so a single thread doing both
     // would deadlock the moment either pipe backs up.
     let name = format!("{}-{}", short(&stream.content_id), fmt);
-    let primed_len = primed.data.len();
+    let primed_len = primed.byte_count();
     let from_keyframe = primed.from_keyframe;
     thread::Builder::new()
         .name(format!("feed-{name}"))
-        .spawn(move || feed_ffmpeg(rx, stdin, primed.data, fed))
+        .spawn(move || feed_ffmpeg(rx, stdin, primed.data, &progress))
         .map_err(|e| format!("could not start feeder: {e}"))?;
 
     let weak = Arc::downgrade(&encoder);
@@ -1070,7 +1201,7 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
         .spawn(move || drain_ffmpeg(weak, stdout, fmt))
         .map_err(|e| format!("could not start drainer: {e}"))?;
 
-    log::info(&format!(
+    log::info!(
         "{}/{}: encoder started (video {}, audio {}, {} bytes replayed{})",
         stream.content_id,
         fmt,
@@ -1082,7 +1213,7 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
         } else {
             ""
         }
-    ));
+    );
     Ok(encoder)
 }
 
@@ -1091,37 +1222,31 @@ fn start_encoder(stream: &Arc<EngineStream>, fmt: OutputFormat) -> Result<Arc<En
 ///
 /// `prime` is the replay snapshot, written before any live data so ffmpeg
 /// starts from a keyframe rather than wherever this encoder happened to
-/// attach. `fed` counts what ffmpeg has accepted, for the puller's stall check.
-fn feed_ffmpeg(
-    rx: Receiver<Bytes>,
-    mut stdin: std::process::ChildStdin,
-    prime: Vec<u8>,
-    fed: Arc<AtomicU64>,
-) {
-    if !prime.is_empty() {
-        if stdin.write_all(&prime).is_err() {
-            return;
-        }
-        fed.fetch_add(prime.len() as u64, Ordering::Relaxed);
-    }
-    while let Ok(chunk) = rx.recv() {
+/// attach. `progress` counts what ffmpeg has accepted, for the puller's stall
+/// check.
+fn feed_ffmpeg(rx: Receiver<Bytes>, mut stdin: ChildStdin, prime: Vec<Bytes>, progress: &Progress) {
+    for chunk in prime.into_iter().chain(rx) {
         if stdin.write_all(&chunk).is_err() {
             break; // ffmpeg exited; the drainer reports why
         }
-        fed.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        progress.advance(chunk.len());
     }
+    // The receiver has dropped with the loop, so a puller woken by this finds
+    // the queue disconnected.
+    progress.close();
 }
 
 /// Read ffmpeg's output, track fMP4 structure, and fan out to listeners.
-fn drain_ffmpeg(encoder: Weak<Encoder>, mut stdout: std::process::ChildStdout, fmt: OutputFormat) {
+fn drain_ffmpeg(encoder: Weak<Encoder>, mut stdout: ChildStdout, fmt: OutputFormat) {
     let mut scanner = fmt.needs_init_segment().then(mp4::Scanner::new);
+    let mut have_init = false;
+    let mut gave_up = false;
     let mut buf = vec![0u8; CHUNK];
 
     loop {
         let n = match stdout.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
-            Err(_) => break,
         };
         // Upgrade per chunk so the last holder leaving ends this thread.
         let Some(enc) = encoder.upgrade() else { break };
@@ -1138,30 +1263,31 @@ fn drain_ffmpeg(encoder: Weak<Encoder>, mut stdout: std::process::ChildStdout, f
                 for piece in s.push(chunk) {
                     enc.fan_out(&piece);
                 }
-                if s.failed() && !enc.unjoinable.load(Ordering::Relaxed) {
-                    log::error(&format!(
-                        "{}/{}: output is not valid fragmented mp4; late joiners refused",
-                        enc.content_id, fmt
-                    ));
-                    enc.unjoinable.store(true, Ordering::Relaxed);
-                    enc.notify_joiners();
-                } else {
-                    let mut init = lock(&enc.init);
-                    if init.is_none() {
-                        if let Some(segment) = s.init_segment() {
-                            *init = Some(segment);
-                            enc.init_ready.notify_all();
-                        }
+                // Once the structure has broken, fragment boundaries are no
+                // longer reliable, so a joiner would take the init segment and
+                // then never attach: refuse joiners from here on.
+                if s.failed() {
+                    if !gave_up {
+                        gave_up = true;
+                        log::error!(
+                            "{}/{}: output is not valid fragmented mp4; late joiners refused",
+                            enc.content_id,
+                            fmt
+                        );
+                        enc.set_output(Output::Unjoinable);
+                    }
+                } else if !have_init {
+                    if let Some(segment) = s.init_segment() {
+                        have_init = true;
+                        enc.set_output(Output::Ready(segment));
                     }
                 }
             }
         }
     }
 
-    // Release anyone still waiting for a first fragment that will not come.
     if let Some(enc) = encoder.upgrade() {
-        enc.finished.store(true, Ordering::Relaxed);
-        enc.notify_joiners();
+        enc.finish();
     }
 }
 
@@ -1173,13 +1299,21 @@ fn spawn_stats_poller(reg: Weak<Registry>) {
         .spawn(move || loop {
             thread::sleep(STATS_INTERVAL);
             let Some(reg) = reg.upgrade() else { return };
-            let streams = reg.live_streams();
+            // Weak handles only across the fetches, so an engine slow to answer
+            // cannot keep a stream alive past its linger.
+            let targets: Vec<(Weak<EngineStream>, String)> = reg
+                .live_streams()
+                .iter()
+                .filter(|s| !s.ended())
+                .filter_map(|s| Some((Arc::downgrade(s), s.stat_url()?)))
+                .collect();
             drop(reg);
-            for s in streams {
-                let Some(url) = s.stat_url() else { continue };
-                match engine::fetch_stats(&url) {
-                    Ok(v) => *lock(&s.stats) = Some((Instant::now(), v)),
-                    Err(e) => log::warn(&format!("{}: stat poll failed: {e}", s.content_id)),
+            for (stream, url) in targets {
+                let polled = engine::fetch_stats(&url);
+                let Some(s) = stream.upgrade() else { continue };
+                match polled {
+                    Ok(v) => *lock(&s.stats) = Some(v),
+                    Err(e) => log::warn!("{}: stat poll failed: {e}", s.content_id),
                 }
             }
         })
@@ -1190,60 +1324,69 @@ fn spawn_stats_poller(reg: Weak<Registry>) {
 mod tests {
     use super::*;
     use crate::format::TrackMode;
+    use std::net::TcpListener;
 
-    fn test_config(encoder_linger: Duration) -> Arc<Config> {
+    /// Poll `cond` until it holds or a generous deadline passes. Timing-based
+    /// assertions wait on the outcome rather than on a fixed sleep, so a slow
+    /// runner is not a failure.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    fn config(encoder_linger: Duration, engine_linger: Duration) -> Arc<Config> {
         Arc::new(Config {
             engine_host: "127.0.0.1:6878".into(),
             frag_duration_ms: None,
             encoder_linger,
-            engine_linger: Duration::ZERO,
+            engine_linger,
         })
     }
 
     fn test_engine_with(config: Arc<Config>) -> Arc<EngineStream> {
-        Arc::new(EngineStream {
-            content_id: "a".repeat(40),
-            started: Instant::now(),
-            bytes_in: AtomicU64::new(0),
-            session: OnceLock::new(),
-            probe: OnceLock::new(),
-            socket: OnceLock::new(),
-            stats: Mutex::new(None),
-            replay: Mutex::new(Replay::new(REPLAY_MAX_AGE, REPLAY_MAX_BYTES)),
-            encoders: Mutex::new(HashMap::new()),
-            creating: Mutex::new(()),
-            start: (Mutex::new(Start::Ready), Condvar::new()),
-            config,
-        })
+        let engine = EngineStream::new(&"a".repeat(40), config);
+        engine.publish(Ok(()));
+        Arc::new(engine)
     }
 
     fn test_engine() -> Arc<EngineStream> {
-        test_engine_with(test_config(Duration::ZERO))
+        test_engine_with(config(Duration::ZERO, Duration::ZERO))
     }
 
     /// An encoder with no ffmpeg behind it, for exercising the fan-out policy.
     fn test_encoder_on(engine: Arc<EngineStream>, fmt: OutputFormat) -> Arc<Encoder> {
-        Arc::new(Encoder {
-            content_id: engine.content_id.clone(),
-            fmt,
-            started: Instant::now(),
-            bytes_out: AtomicU64::new(0),
-            video: TrackMode::Copy,
-            audio: TrackMode::Copy,
-            primed_behind_live: None,
-            init: Mutex::new(None),
-            init_ready: Condvar::new(),
-            unjoinable: AtomicBool::new(false),
-            finished: AtomicBool::new(false),
-            listeners: Mutex::new(Vec::new()),
-            next_id: AtomicU64::new(0),
-            child: Mutex::new(None),
+        Arc::new(Encoder::new(
             engine,
-        })
+            fmt,
+            TrackMode::Copy,
+            TrackMode::Copy,
+            None,
+        ))
     }
 
     fn test_encoder(fmt: OutputFormat) -> Arc<Encoder> {
         test_encoder_on(test_engine(), fmt)
+    }
+
+    /// Register `enc` with its engine as the puller would see it. The receiver
+    /// is returned so the feed stays connected for as long as the test wants.
+    fn register(enc: &Arc<Encoder>) -> Receiver<Bytes> {
+        let (tx, rx) = sync_channel::<Bytes>(TS_QUEUE);
+        lock(&enc.engine.encoders).insert(
+            enc.fmt,
+            Feed {
+                encoder: Arc::downgrade(enc),
+                tx,
+                progress: Arc::default(),
+            },
+        );
+        rx
     }
 
     fn media(len: usize, fragment_start: bool, keyframe: bool) -> mp4::Piece {
@@ -1270,7 +1413,7 @@ mod tests {
     #[test]
     fn fmp4_listeners_wait_for_a_keyframe_fragment() {
         let enc = test_encoder(OutputFormat::Fmp4);
-        *lock(&enc.init) = Some(Bytes::from_static(b"ftypmoov"));
+        enc.set_output(Output::Ready(Bytes::from_static(b"ftypmoov")));
         let s = sub(&enc, "peer");
 
         // Mid-fragment bytes are useless to a client holding only the init
@@ -1299,25 +1442,24 @@ mod tests {
         let writer = enc.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(150));
-            *lock(&writer.init) = Some(Bytes::from_static(b"ftypmoov"));
-            writer.init_ready.notify_all();
+            writer.set_output(Output::Ready(Bytes::from_static(b"ftypmoov")));
         });
 
         // Waiting is the whole point: tearing down and retrying would restart
         // ffmpeg and never converge.
         let began = Instant::now();
-        assert!(enc.subscribe("peer".into(), None).is_ok());
+        assert!(enc.clone().subscribe("peer".into(), None).is_ok());
         assert!(began.elapsed() >= Duration::from_millis(150));
     }
 
     #[test]
     fn fmp4_subscribe_fails_fast_once_the_encoder_has_finished() {
         let enc = test_encoder(OutputFormat::Fmp4);
-        enc.finished.store(true, Ordering::Relaxed);
+        enc.finish();
         let began = Instant::now();
-        assert!(enc.subscribe("peer".into(), None).is_err());
+        assert!(enc.clone().subscribe("peer".into(), None).is_err());
         // Must not sit out the full INIT_TIMEOUT waiting on a dead encoder.
-        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(began.elapsed() < INIT_TIMEOUT / 3);
     }
 
     #[test]
@@ -1325,11 +1467,11 @@ mod tests {
         let enc = test_encoder(OutputFormat::Fmp4);
         // Init was cached before the structure broke. Serving it anyway would
         // leave the joiner waiting forever for a boundary that never comes.
-        *lock(&enc.init) = Some(Bytes::from_static(b"ftypmoov"));
-        enc.unjoinable.store(true, Ordering::Relaxed);
+        enc.set_output(Output::Ready(Bytes::from_static(b"ftypmoov")));
+        enc.set_output(Output::Unjoinable);
         let began = Instant::now();
-        assert!(enc.subscribe("peer".into(), None).is_err());
-        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(enc.clone().subscribe("peer".into(), None).is_err());
+        assert!(began.elapsed() < INIT_TIMEOUT / 3);
     }
 
     #[test]
@@ -1352,12 +1494,11 @@ mod tests {
     #[test]
     fn a_listener_that_keeps_up_is_never_evicted_on_bytes_alone() {
         let enc = test_encoder(OutputFormat::Adts);
-        let mut s = sub(&enc, "peer");
+        let s = sub(&enc, "peer");
         let piece = media(1024 * 1024, true, true);
-        let mut buf = vec![0u8; 1024 * 1024];
         for _ in 0..(SUB_MAX_BYTES / (1024 * 1024) * 3) {
             enc.fan_out(&piece);
-            assert_eq!(s.read(&mut buf).unwrap(), buf.len());
+            assert_eq!(s.recv().map(|b| b.len()), Some(1024 * 1024));
         }
         assert_eq!(enc.listener_count(), 1);
     }
@@ -1376,7 +1517,7 @@ mod tests {
 
     #[test]
     fn the_last_listener_leaving_lingers_the_encoder() {
-        let engine = test_engine_with(test_config(Duration::from_millis(100)));
+        let engine = test_engine_with(config(Duration::from_millis(100), Duration::ZERO));
         let enc = test_encoder_on(engine, OutputFormat::Adts);
         let a = sub(&enc, "a");
         let b = sub(&enc, "b");
@@ -1387,14 +1528,16 @@ mod tests {
             "not the last to leave: no linger"
         );
         drop(b);
-        assert_eq!(Arc::strong_count(&enc), 2, "the linger thread holds it");
+        assert_eq!(Arc::strong_count(&enc), 2, "the linger holds it");
         assert!(enc.lingering());
         // A rejoin within the linger finds the same encoder, still registered.
         let c = sub(&enc, "c");
         assert!(!enc.lingering());
         drop(c);
-        thread::sleep(Duration::from_millis(300));
-        assert_eq!(Arc::strong_count(&enc), 1, "the linger has lapsed");
+        assert!(
+            eventually(|| Arc::strong_count(&enc) == 1),
+            "the linger has lapsed"
+        );
     }
 
     #[test]
@@ -1405,60 +1548,43 @@ mod tests {
     }
 
     #[test]
-    fn subscription_read_hands_back_partial_chunks() {
+    fn subscription_hands_out_chunks_in_order() {
         let enc = test_encoder(OutputFormat::Adts);
-        let mut s = sub(&enc, "peer");
+        let s = sub(&enc, "peer");
         enc.fan_out(&media(10, true, true));
-
-        // The request thread reads with whatever buffer it likes; a chunk larger
-        // than the buffer must be handed out across successive reads.
-        let mut buf = [0u8; 3];
-        let mut total = 0;
-        for _ in 0..4 {
-            let n = s.read(&mut buf).unwrap();
-            total += n;
-            if total == 10 {
-                break;
-            }
-        }
-        assert_eq!(total, 10);
+        enc.fan_out(&media(3, true, true));
+        assert_eq!(s.recv().map(|b| b.len()), Some(10));
+        assert_eq!(s.try_recv().map(|b| b.len()), Some(3));
+        assert_eq!(s.try_recv(), None, "nothing more is queued");
     }
 
     #[test]
-    fn subscription_read_ends_cleanly_when_the_encoder_stops() {
+    fn subscription_ends_cleanly_when_the_listener_is_dropped() {
         let enc = test_encoder(OutputFormat::Adts);
-        let mut s = sub(&enc, "peer");
+        let s = sub(&enc, "peer");
         // Dropping every listener handle closes the channel.
         lock(&enc.listeners).clear();
-        let mut buf = [0u8; 8];
-        assert_eq!(s.read(&mut buf).unwrap(), 0, "must EOF, not error");
+        assert_eq!(s.recv(), None);
     }
 
     #[test]
     fn fmp4_listeners_receive_the_init_segment_first() {
         let enc = test_encoder(OutputFormat::Fmp4);
-        *lock(&enc.init) = Some(Bytes::from_static(b"ftypmoov"));
-        let mut s = sub(&enc, "peer");
+        enc.set_output(Output::Ready(Bytes::from_static(b"ftypmoov")));
+        let s = sub(&enc, "peer");
         enc.fan_out(&media(4, true, true));
-
-        let mut buf = [0u8; 8];
-        assert_eq!(s.read(&mut buf).unwrap(), 8);
-        assert_eq!(&buf, b"ftypmoov", "init segment must precede all media");
+        assert_eq!(
+            s.recv().as_deref(),
+            Some(&b"ftypmoov"[..]),
+            "init segment must precede all media"
+        );
     }
 
     #[test]
     fn encoder_deregisters_itself_from_the_engine_on_drop() {
         let engine = test_engine();
         let enc = test_encoder_on(engine.clone(), OutputFormat::Adts);
-        let (tx, _rx) = sync_channel::<Bytes>(TS_QUEUE);
-        lock(&engine.encoders).insert(
-            OutputFormat::Adts,
-            Feed {
-                encoder: Arc::downgrade(&enc),
-                tx,
-                fed: Arc::new(AtomicU64::new(0)),
-            },
-        );
+        let _rx = register(&enc);
         assert_eq!(engine.live_encoders().len(), 1);
         assert!(!engine.lingering());
 
@@ -1471,63 +1597,247 @@ mod tests {
 
     #[test]
     fn the_last_encoder_leaving_lingers_the_engine() {
-        let config = Arc::new(Config {
-            engine_host: "127.0.0.1:6878".into(),
-            frag_duration_ms: None,
-            encoder_linger: Duration::ZERO,
-            engine_linger: Duration::from_millis(100),
-        });
-        let engine = test_engine_with(config);
+        let engine = test_engine_with(config(Duration::ZERO, Duration::from_millis(100)));
         let enc = test_encoder_on(engine.clone(), OutputFormat::Adts);
-        let (tx, _rx) = sync_channel::<Bytes>(TS_QUEUE);
-        lock(&engine.encoders).insert(
-            OutputFormat::Adts,
-            Feed {
-                encoder: Arc::downgrade(&enc),
-                tx,
-                fed: Arc::new(AtomicU64::new(0)),
-            },
-        );
+        let _rx = register(&enc);
         drop(enc);
+        assert_eq!(Arc::strong_count(&engine), 2, "the linger holds the pull");
+        assert!(eventually(|| Arc::strong_count(&engine) == 1));
+    }
+
+    // -- The engine stopping -------------------------------------------------
+
+    #[test]
+    fn a_finished_encoder_ends_every_listener() {
+        let enc = test_encoder(OutputFormat::Adts);
+        let a = sub(&enc, "a");
+        let b = sub(&enc, "b");
+        enc.fan_out(&media(10, true, true));
+        // The regression: listeners keep the encoder alive, so nothing but
+        // `finish` can close their channels, and before it existed they
+        // blocked in recv forever after ffmpeg exited.
+        enc.finish();
         assert_eq!(
-            Arc::strong_count(&engine),
-            2,
-            "the linger thread holds the pull"
+            a.recv().map(|b| b.len()),
+            Some(10),
+            "queued data still arrives"
         );
-        thread::sleep(Duration::from_millis(300));
-        assert_eq!(Arc::strong_count(&engine), 1);
+        assert_eq!(a.recv(), None);
+        assert_eq!(b.try_recv().map(|b| b.len()), Some(10));
+        assert_eq!(b.recv(), None);
     }
 
     #[test]
-    fn backpressure_gives_up_only_without_progress() {
-        let (tx, rx) = sync_channel::<Bytes>(1);
-        let fed = Arc::new(AtomicU64::new(0));
-        tx.try_send(Bytes::from_static(b"x")).unwrap();
-        // A full queue that is draining must never trip the stall: simulate a
-        // feeder that makes progress and frees a slot shortly.
-        let fed2 = fed.clone();
+    fn a_finished_encoder_does_not_linger() {
+        let engine = test_engine_with(config(Duration::from_secs(3600), Duration::ZERO));
+        let enc = test_encoder_on(engine, OutputFormat::Adts);
+        let a = sub(&enc, "a");
+        let b = sub(&enc, "b");
+        enc.finish();
+        drop(a);
+        drop(b);
+        assert_eq!(Arc::strong_count(&enc), 1, "nothing left to reconnect to");
+    }
+
+    #[test]
+    fn ending_the_pull_closes_every_feed() {
+        let engine = test_engine();
+        let enc = test_encoder_on(engine.clone(), OutputFormat::Adts);
+        let rx = register(&enc);
+        engine.end();
+        assert!(engine.ended());
+        assert!(rx.recv().is_err(), "the feeder sees its input end");
+        assert!(lock(&engine.encoders).is_empty());
+    }
+
+    #[test]
+    fn no_encoder_starts_on_an_ended_pull() {
+        let engine = test_engine();
+        let _ = engine.probe.set(Probe::default());
+        engine.end();
+        let err = start_encoder(&engine, OutputFormat::Adts).err();
+        assert_eq!(err.as_deref(), Some("engine stream has ended"));
+        assert!(lock(&engine.encoders).is_empty());
+    }
+
+    #[test]
+    fn a_startup_outcome_is_not_overwritten() {
+        let engine = EngineStream::new("x", config(Duration::ZERO, Duration::ZERO));
+        engine.publish(Ok(()));
+        engine.publish(Err("later".into()));
+        assert_eq!(engine.wait_ready(), Ok(()));
+    }
+
+    #[test]
+    fn an_ended_pull_is_replaced_rather_than_joined() {
+        let reg = Registry::new(Config {
+            engine_host: "127.0.0.1:1".into(),
+            frag_duration_ms: None,
+            encoder_linger: Duration::ZERO,
+            engine_linger: Duration::ZERO,
+        });
+        let id = "c".repeat(40);
+        let old = Arc::new(EngineStream::new(&id, reg.config.clone()));
+        old.publish(Ok(()));
+        old.end();
+        lock(&reg.streams).insert(id.clone(), Arc::downgrade(&old));
+        // The fresh puller fails fast (nothing listens on port 1); what matters
+        // is that the ended stream was not handed out as a ready one.
+        assert!(reg.engine_stream(&id).is_err());
+        let now = lock(&reg.streams).get(&id).and_then(Weak::upgrade);
+        assert!(now.is_none_or(|s| !Arc::ptr_eq(&s, &old)));
+    }
+
+    /// End to end, against a stand-in engine that serves a few seconds of real
+    /// TS and then closes the connection: the listener's response must end,
+    /// and the content id must not be left holding a dead pull. Skips itself
+    /// where there is no ffmpeg.
+    #[test]
+    fn a_stream_the_engine_closes_ends_for_its_listeners() {
+        let Some(ts) = test_ts() else { return };
+        let engine = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = engine.local_addr().unwrap().to_string();
         thread::spawn(move || {
+            for conn in engine.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let ts = ts.clone();
+                thread::spawn(move || {
+                    let mut head = [0u8; 1024];
+                    let n = conn.read(&mut head).unwrap_or(0);
+                    if String::from_utf8_lossy(&head[..n]).contains("format=json") {
+                        // No JSON handshake: the proxy falls back to a direct pull.
+                        let _ =
+                            conn.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                        return;
+                    }
+                    let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\r\n");
+                    for chunk in ts.chunks(32 * 1024) {
+                        if conn.write_all(chunk).is_err() {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    // Dropping the connection is the engine ending the stream.
+                });
+            }
+        });
+
+        let reg = Registry::new(Config {
+            engine_host: host,
+            frag_duration_ms: None,
+            encoder_linger: Duration::from_secs(3600),
+            engine_linger: Duration::from_secs(3600),
+        });
+        let id = "d".repeat(40);
+        let s = reg
+            .subscribe(&id, OutputFormat::Adts, "peer", None)
+            .unwrap();
+        let (done, ended) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut bytes = 0;
+            while let Some(chunk) = s.recv() {
+                bytes += chunk.len();
+            }
+            let _ = done.send(bytes);
+        });
+        let bytes = ended
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the listener's response never ended");
+        assert!(bytes > 0, "audio arrived before the end");
+        // Even with lingers that would outlast the test, the ended pull is not
+        // handed to the next request.
+        assert!(lock(&reg.streams)
+            .get(&id)
+            .and_then(Weak::upgrade)
+            .is_none_or(|s| s.ended()));
+    }
+
+    /// A few seconds of H.264 + AAC in MPEG-TS, or `None` without ffmpeg.
+    fn test_ts() -> Option<Arc<Vec<u8>>> {
+        let out = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=25",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine",
+                "-t",
+                "3",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "25",
+                "-c:a",
+                "aac",
+                "-f",
+                "mpegts",
+                "-",
+            ])
+            .output()
+            .ok()?;
+        (out.status.success() && !out.stdout.is_empty()).then(|| Arc::new(out.stdout))
+    }
+
+    // -- Backpressure --------------------------------------------------------
+
+    #[test]
+    fn backpressure_waits_for_a_draining_encoder() {
+        let (tx, rx) = sync_channel::<Bytes>(1);
+        let progress = Arc::new(Progress::default());
+        tx.try_send(Bytes::from_static(b"x")).unwrap();
+        // A full queue that is draining must never trip the stall: a feeder
+        // that takes the chunk and reports progress a little later.
+        let feeder = progress.clone();
+        let handle = thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-            fed2.fetch_add(1, Ordering::Relaxed);
-            rx.recv().unwrap();
-            // Keep the receiver alive long enough for the send to land.
-            thread::sleep(Duration::from_millis(200));
-            drop(rx);
+            let chunk = rx.recv().unwrap();
+            feeder.advance(chunk.len());
+            rx.recv().unwrap()
         });
         assert_eq!(
-            send_backpressured(&tx, &fed, Bytes::from_static(b"y")),
+            send_backpressured(&tx, &progress, Bytes::from_static(b"y")),
             Ok(())
         );
+        assert_eq!(handle.join().unwrap(), Bytes::from_static(b"y"));
     }
 
     #[test]
     fn backpressure_reports_a_gone_encoder() {
         let (tx, rx) = sync_channel::<Bytes>(1);
         drop(rx);
-        let fed = AtomicU64::new(0);
         assert_eq!(
-            send_backpressured(&tx, &fed, Bytes::from_static(b"y")),
-            Err("gone")
+            send_backpressured(&tx, &Progress::default(), Bytes::from_static(b"y")),
+            Err(Wedged::Gone)
+        );
+    }
+
+    #[test]
+    fn backpressure_wakes_promptly_when_the_feeder_exits() {
+        let (tx, rx) = sync_channel::<Bytes>(1);
+        let progress = Arc::new(Progress::default());
+        tx.try_send(Bytes::from_static(b"x")).unwrap();
+        let feeder = progress.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(rx);
+            feeder.close();
+        });
+        let began = Instant::now();
+        assert_eq!(
+            send_backpressured(&tx, &progress, Bytes::from_static(b"y")),
+            Err(Wedged::Gone)
+        );
+        assert!(
+            began.elapsed() < TS_STALL,
+            "must not wait out the stall timeout"
         );
     }
 

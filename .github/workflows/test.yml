@@ -4,17 +4,34 @@ on:
   push:
     branches: [ 'main' ]
   pull_request:
+  # Called by the tag build, so an image is only published once this passes.
+  workflow_call:
 
 jobs:
   test:
     runs-on: 'ubuntu-latest'
+    permissions:
+      contents: 'read'
     steps:
-      - uses: 'actions/checkout@v4'
-      - uses: 'dtolnay/rust-toolchain@stable'
+      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
+      - uses: 'dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249' # stable
         with:
+          toolchain: 'stable'
           components: 'clippy'
       # The ffmpeg-backed tests skip themselves when no ffmpeg is present;
       # installing one makes them run.
       - run: 'sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg'
       - run: 'cargo clippy --all-targets --locked -- -D warnings'
       - run: 'cargo test --locked'
+
+  # The image itself, so a Dockerfile or musl build break shows up on the pull
+  # request rather than at release. Skipped under the tag build, which builds
+  # the image for real straight after.
+  image:
+    if: "github.ref_type != 'tag'"
+    runs-on: 'ubuntu-latest'
+    permissions:
+      contents: 'read'
+    steps:
+      - uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' # v7.0.1
+      - run: 'docker build .'

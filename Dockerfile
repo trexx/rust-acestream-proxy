@@ -5,7 +5,8 @@ FROM rust:1.99-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d64644
 RUN apk add --no-cache musl-dev
 
 WORKDIR /src
-# Manifests first so the dependency compile lands on its own cached layer.
+# One layer for manifests and source: with two small dependencies, a separate
+# dependency-only build layer would save seconds and cost a stub main.rs.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 # Alpine's host target is x86_64-unknown-linux-musl, where Rust links musl
