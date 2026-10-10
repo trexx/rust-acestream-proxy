@@ -4,11 +4,13 @@
   "extends": [
     "docker:enableMajor",
     "docker:pinDigests",
+    "helpers:pinGitHubActionDigests",
     "default:automergeDigest",
     "default:automergeMinor"
   ],
   "enabledManagers": [
     "dockerfile",
+    "github-actions",
     "cargo",
     "custom.regex"
   ],
