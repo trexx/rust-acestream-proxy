@@ -6,7 +6,7 @@ on:
 
 jobs:
   scan:
-    uses: 'trexx/actions/.github/workflows/trivy.yml@e9856c9003c97468cfa1cbc1a8130863b797d832' # main
+    uses: 'trexx/actions/.github/workflows/trivy.yml@e55688a60847a9cf87d0ead14cf3885560ab9bac' # main
     secrets: 'inherit'
     permissions:
       packages: 'read'
