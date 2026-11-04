@@ -14,7 +14,6 @@ COPY src ./src
 RUN cargo build --release --locked
 
 FROM docker.io/mwader/static-ffmpeg:9.0.2-amd64@sha256:73e53e0efe712c0dda05ec65c18e7185f2638c33293d62dd9d541b081c0b523d
-LABEL org.opencontainers.image.source="https://github.com/trexx/rust-acestream-proxy"
 
 # The base image ships /ffmpeg and /ffprobe at the filesystem root; the service
 # exec's them by name, so "/" must be on PATH.
