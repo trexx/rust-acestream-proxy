@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    uses: 'trexx/actions/.github/workflows/rust-check.yml@shared-steps'
+    uses: 'trexx/actions/.github/workflows/rust-check.yml@main'
     permissions:
       contents: 'read'
     with:
@@ -29,5 +29,5 @@ jobs:
     permissions:
       contents: 'read'
     steps:
-      - uses: 'trexx/actions/.github/actions/checkout@shared-steps'
+      - uses: 'trexx/actions/.github/actions/checkout@main'
       - run: 'docker build .'
