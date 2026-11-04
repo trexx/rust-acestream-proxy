@@ -1,21 +1,10 @@
 # rust-acestream-proxy
+
 A tiny Rust service that pulls an AceStream engine stream **once** and re-serves it to many listeners — as audio-only (for cars and phones) or as fragmented MP4 with the video track copied untouched (for browsers). The full muxed stream (~3–6 Mbps) becomes an audio stream of ~100–300 kbps, so the mobile-data leg shrinks by an order of magnitude. Every mode of [docker-acestream-webplayer](https://github.com/trexx/docker-acestream-webplayer) — Stream, Listen and Cast — fetches from it; no client talks to the engine directly.
 
-## Endpoints
+## Overview
 
-```
-GET /audio?id=<40-hex content id>[&fmt=adts|mp3]
-GET /video?id=<40-hex content id>
-GET /status
-GET /healthz
-```
-
-* `id` — the AceStream content id (40 hex chars, required).
-* `fmt` — audio output format. `adts` (AAC, default — browsers and Chromecast Audio both play it, and it keeps the stream-copy path) or `mp3` (fallback for devices that won't play ADTS).
-
-`/video` serves fragmented MP4 that a browser `<video>` element plays natively as a progressive stream; MSE and players such as mpv take it too. The engine to pull from comes from the required `ENGINE_HOST` env var. `HEAD` on either stream endpoint is answered without starting anything, since players commonly probe with one before the GET.
-
-## One engine pull per content id
+### One engine pull per content id
 
 Every listener used to cost a separate full-bitrate pull from the engine. Now a single puller holds one engine session per content id and fans the raw MPEG-TS out to one ffmpeg per output format, each of which fans out to its own listeners:
 
@@ -32,7 +21,7 @@ Not on the spot, though. A reconnect is the common case for a live viewer — a 
 
 The source is identified **once** per content id, from the PMT in the first packets of the pull — no ffprobe, no preroll to wait for — so the first listener starts as soon as the engine sends anything and later ones with no delay at all. MPEG audio's layer, which the PMT does not carry and which decides whether `fmt=mp3` copies or transcodes, is read from the first frame header. ffprobe remains only as a fallback, over a 256 KB preroll, for a private stream the parser cannot name.
 
-## Copy-first design
+### Copy-first design
 
 | Endpoint | Source audio | Video | Audio |
 | --- | --- | --- | --- |
@@ -45,13 +34,13 @@ The source is identified **once** per content id, from the PMT in the first pack
 
 Video is always stream-copied — that is where the CPU saving is, and no pixel is ever decoded. Audio is copied when the source codec is already browser-playable. The asymmetry on `/video` is not optional: AC-3, E-AC-3 and MP2 are legal inside MP4 but browsers will not decode them, so a blanket `-c copy` would produce video with silence.
 
-## Latency
+### Latency
 
 Tuned for low latency throughout: `-flush_packets 1` and `-avioflags direct` on ffmpeg's *output* stop it buffering ~32KB before it writes (at 128 kbps that alone is ~2 s), the fan-out hands every chunk straight to each listener's socket, and `TCP_NODELAY` is set so Nagle can't sit on a frame.
 
 The figures below were measured on ffmpeg 8.1 with a constant-bitrate 3.5 Mbps 720p test stream (3 s GOP) fed through a pipe at real-time rate, the way the puller feeds ffmpeg; the recipe is under *Local development*.
 
-### Starting an encoder
+#### Starting an encoder
 
 ffmpeg must see a keyframe before it can copy H.264 into MP4 (the SPS/PPS it needs arrive only with one), and MPEG-TS has no header, so it analyses `-analyzeduration` worth of input from wherever it starts reading — no less, and it cannot stop early. Three things follow, and the service is built around them.
 
@@ -74,13 +63,13 @@ Time from encoder start to first output, input fed at real-time rate:
 
 `-fflags nobuffer` looks like a low-latency setting but measured *worse* — about 2 s on video, 0.6 s on audio — because it slows stream analysis; it is deliberately not used.
 
-### Fragments
+#### Fragments
 
 `/video` has a floor that no amount of flushing moves: an fMP4 `moof` carries its fragment's sample table, so it cannot be written until the fragment is complete. With keyframe-only fragmentation every fragment is one GOP and is emitted when the *next* keyframe arrives — measured, a 3 s GOP gave a `moof` every 3.0 s, each about 3.1 s after its own start — so a viewer sits a whole GOP behind, and a joiner waits up to another.
 
 So fragments are also cut on a timer, `FRAG_DURATION_MS` (default 1000). ffmpeg combines the two conditions: every keyframe still opens a fragment, and the fragments in between are a second long. The scanner reads each `moof`'s sample flags and aligns a late joiner to the next fragment that **starts on a keyframe**, so the timed cuts cost no artifacts — a bare `-frag_duration`, which this knob used to set, opened every fragment but the first on a non-sync sample, and a late joiner decoded garbage until the next IDR. A joiner still waits up to one GOP for a keyframe fragment, but then sits ~1 s behind the encoder instead of ~3 s. `FRAG_DURATION_MS=0` restores keyframe-only fragmentation.
 
-### Reconnects and late joiners
+#### Reconnects and late joiners
 
 Late joiners on `/video` are handled: the init segment (`ftyp` + `moov`) is cached and replayed to every new listener, which is then aligned to the next keyframe fragment. Audio formats need none of this — ADTS and MP3 resynchronise on any byte offset. With the encoder and engine lingers described above, a rejoin during a match costs no engine round trip at all: measured end to end against a stand-in engine, a `/video` client that reconnected 2 s after leaving had its init segment in 30 ms and media at the next keyframe fragment, and `HEAD` probes cost nothing.
 
@@ -90,17 +79,23 @@ Cold start adds P2P swarm discovery, typically 10–25 s before the engine serve
 
 Throughput is not the constraint the copy-first design was built to avoid. Serving a 1080 p 6.1 Mbps stream to five listeners across three formats simultaneously, the three ffmpeg processes used **0.5–4.1 % CPU** — the stream-copy paths are nearly free, and only the MP3 transcode registers at all.
 
-## Configuration
+## Usage
 
-| Env var | Default | Purpose |
-| --- | --- | --- |
-| `ENGINE_HOST` | *(required)* | AceStream engine `host[:port]` to pull streams from |
-| `LISTEN_ADDR` | `:8080` | HTTP listen address |
-| `FRAG_DURATION_MS` | `1000` | fMP4 fragment duration; keyframes always open a fragment as well. `0` fragments on keyframes only, which costs a full GOP of latency |
-| `ENCODER_LINGER_S` | `15` | How long an ffmpeg outlives its last listener, so a reconnect joins it. `0` disables |
-| `ENGINE_LINGER_S` | `60` | How long an engine pull outlives its last encoder, so a reconnect skips swarm discovery. `0` disables |
+### Endpoints
 
-## Monitoring
+```
+GET /audio?id=<40-hex content id>[&fmt=adts|mp3]
+GET /video?id=<40-hex content id>
+GET /status
+GET /healthz
+```
+
+* `id` — the AceStream content id (40 hex chars, required).
+* `fmt` — audio output format. `adts` (AAC, default — browsers and Chromecast Audio both play it, and it keeps the stream-copy path) or `mp3` (fallback for devices that won't play ADTS).
+
+`/video` serves fragmented MP4 that a browser `<video>` element plays natively as a progressive stream; MSE and players such as mpv take it too. The engine to pull from comes from the required `ENGINE_HOST` env var. `HEAD` on either stream endpoint is answered without starting anything, since players commonly probe with one before the GET.
+
+### Monitoring
 
 `GET /status` returns JSON describing every active pull, the encoders hanging off it, their listeners, and the engine's own view of each swarm (peers, speeds — passed through verbatim from the engine's `stat_url`, since its shape varies by version):
 
@@ -127,17 +122,29 @@ Throughput is not the constraint the copy-first design was built to avoid. Servi
 
 `summary.engine_pulls` staying at one while `encoders` and `listeners` climb is the fan-out doing its job. `lingering` marks an encoder with no listener, or a pull with no encoder, being kept for a reconnect. `/healthz` is there for probes.
 
-## Deployment
+### Deployment
 
 Run it in the same cluster as the engine — it pulls the full muxed stream per content id. Set `ENGINE_HOST` to the engine's in-cluster address.
 
-## Casting to a Chromecast
+### Casting to a Chromecast
 
 A video Chromecast is sent `/video` and plays it directly; that has been verified on a real device. Audio-only cast targets can't decode the muxed TS — hand them this service's stream instead. Chromecast Audio plays AAC, so the default (ADTS) output works and keeps the stream-copy path: the device receives the original audio untouched. The webplayer expects this service path-routed at `/audio` on the engine host, so the Home Assistant automation should call `media_player.play_media` with `http://<host from the cast payload>/audio?id=<id>` and `media_content_type: "music"` for audio devices. If a device won't play ADTS, append `&fmt=mp3` as a fallback.
 
 The webplayer's Cast picks the endpoint per device: entries marked audio-only are sent `/audio`, the rest `/video`.
 
-## Local development
+## Configuration
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `ENGINE_HOST` | *(required)* | AceStream engine `host[:port]` to pull streams from |
+| `LISTEN_ADDR` | `:8080` | HTTP listen address |
+| `FRAG_DURATION_MS` | `1000` | fMP4 fragment duration; keyframes always open a fragment as well. `0` fragments on keyframes only, which costs a full GOP of latency |
+| `ENCODER_LINGER_S` | `15` | How long an ffmpeg outlives its last listener, so a reconnect joins it. `0` disables |
+| `ENGINE_LINGER_S` | `60` | How long an engine pull outlives its last encoder, so a reconnect skips swarm discovery. `0` disables |
+
+## Development
+
+### Local development
 
 ```sh
 cargo test
@@ -152,3 +159,11 @@ curl -v 'http://127.0.0.1:8080/video?id=<content id>' | mpv -
 No AceStream engine is needed to exercise the service: point `ENGINE_HOST` at any HTTP server that returns MPEG-TS on every path. `ffmpeg -f lavfi -i testsrc2 -f lavfi -i sine -c:v libx264 -c:a ac3 -f mpegts test.ts` generates a suitable source.
 
 For timing measurements, make the source constant-bitrate so that bytes map to seconds, then serve it at that rate: `-c:v libx264 -g 75 -keyint_min 75 -sc_threshold 0 -b:v 2800k -minrate 2800k -maxrate 2800k -bufsize 2800k -x264-params nal-hrd=cbr -c:a aac -muxrate 3500000` gives a 3 s GOP at exactly 437,500 bytes/s, and starting the feed a fraction of a GOP in (`tail -c +568751`) reproduces a mid-GOP attach. The ffmpeg arguments the service uses are the `plan` function's output in `src/format.rs`.
+
+### CI
+
+On pushes to `main` and on pull requests, `.github/workflows/test.yml` runs `cargo clippy` (warnings are errors) and `cargo test` on Ubuntu with ffmpeg installed, so the ffmpeg-backed tests run rather than skip; formatting is not checked yet. It also runs `docker build .`, so a Dockerfile or musl build break shows up on the pull request. `.github/workflows/trivy.yml` scans the published `:latest` image daily.
+
+## Releases
+
+Pushing a version tag (`*.*.*`, e.g. `1.0.0`) runs the tests and then builds the image and pushes it to `ghcr.io/trexx/rust-acestream-proxy`, tagged with the version and `latest` (`.github/workflows/build.yml`, using the shared `trexx/actions` build workflow).
