@@ -10,10 +10,6 @@
     "cargo",
     "custom.regex"
   ],
-  "lockFileMaintenance": {
-    "enabled": true,
-    "automerge": true
-  },
   "packageRules": [
     {
       "description": "rust-version is a bare MSRV string with nowhere to hang a digest. docker:pinDigests matches on the docker datasource, so without this it queues a pinDigest update the regex below can never write, and the branch errors out on every run.",
