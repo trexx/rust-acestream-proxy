@@ -1,4 +1,4 @@
-FROM rust:1.99-alpine@sha256:f432d4b8663fbc50b29e33846bf6a1fb9f17f142023598899d641cddf57c6b22 AS build
+FROM rust:1.99-alpine@sha256:98e4492621c23872a502a7171b7d2b105fdc114276856f71051f38bf94ee26aa AS build
 
 # musl-dev supplies the linker; nothing here needs OpenSSL, since the engine is
 # plain HTTP and the service terminates no TLS of its own.
